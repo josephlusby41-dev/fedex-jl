@@ -49,16 +49,14 @@ BASE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>%s</title>
 <style>%s</style></head><body>
 <header class="topbar"><div class="brand">FedEx</div>
-<nav><a href="/">Home</a><a href="/track">Track</a><a href="/admin">Admin</a></nav></header>
+<nav><a href="/">Home</a><a href="/track">Track</a></nav></header>
 %s</body></html>"""
 
 HOME = BASE % ("Track", CSS, """
 <section class="hero"><h1>Track your shipment</h1>
 <form action="/track" method="post" class="box">
 <input name="num" placeholder="Enter tracking number"><button>Track</button></form>
-<p class="hint"><a href="#" id=g>Generate a tracking number</a> — <span id=o></span></p></section>
-<script>g.onclick=async e=>{e.preventDefault();const r=await fetch('/generate');const j=await r.json();
-document.querySelector('input[name=num]').value=j.num;o.textContent=j.num;}</script>""")
+</section>""")
 
 TRACKPAGE = BASE % ("Track", CSS, """
 <section class="hero"><h1>Track by number</h1>
@@ -74,9 +72,12 @@ RESULT = BASE % ("Tracking", CSS, """
 {% else %}<div class="ev">No activity yet.</div>{% endfor %}</div></section>""")
 
 ADMIN = BASE % ("Admin", CSS, """
-<section class="hero"><h1>Admin</h1>{{ msg|safe }}
-<form method="post" action="/admin/add?k={{k}}" class="box">
-<input name="num" placeholder="Tracking number (blank = auto)">
+<section class="hero"><h1>Admin</h1>
+<p><a href="{{ url_for('home') }}">Back to tracking</a></p>{{ msg|safe }}
+<form method="post" action="{{ url_for('panel_add', k=k) }}" class="box">
+<input id="package-number" name="num" placeholder="Tracking number (blank = auto)">
+<button type="button" id="generate-number">Generate</button>
+<p id="generate-error" role="status"></p>
 <input name="status" placeholder="Status (e.g. In transit)">
 <input name="origin" placeholder="Origin city"><input name="dest" placeholder="Destination city">
 <button>Create package</button></form>
@@ -85,13 +86,27 @@ ADMIN = BASE % ("Admin", CSS, """
 {% for p in pkgs %}<tr><td><a href="/result/{{p['num']}}">{{p['num']}}</a></td>
 <td>{{p['status']}}</td><td>{{p['origin']}}→{{p['dest']}}</td></tr>{% endfor %}</table>{% endif %}
 <h3 style="margin:28px 0 8px">Add event</h3>
-<form method="post" action="/admin/event?k={{k}}" class="box">
+<form method="post" action="{{ url_for('panel_event', k=k) }}" class="box">
 <input name="num" placeholder="Tracking number" required>
 <input name="text" placeholder="Event text (e.g. Customs clearance)" required>
 <input name="loc" placeholder="Location" required>
 <input name="when" placeholder="2026-11-23 09:14" required>
 <input name="status" placeholder="Set new status (optional)">
-<button>Add event</button></form></section>""")
+<button>Add event</button></form></section>
+<script>
+document.getElementById('generate-number').addEventListener('click', async () => {
+  const error = document.getElementById('generate-error');
+  error.textContent = '';
+  try {
+    const response = await fetch({{ url_for('generate') | tojson }});
+    if (!response.ok) throw new Error('Request failed');
+    const data = await response.json();
+    document.getElementById('package-number').value = data.num;
+  } catch {
+    error.textContent = 'Could not generate a tracking number. Try again.';
+  }
+});
+</script>""")
 
 def gen():
     base = "".join(random.choices(string.digits, k=10))
@@ -127,30 +142,30 @@ def result(num):
     ev = c.execute("SELECT * FROM events WHERE num=? ORDER BY [when] DESC", (num,)).fetchall()
     return render_template_string(RESULT, p=p, ev=ev)
 
-@app.route("/admin")
-def admin():
+@app.route("/panel")
+def panel():
     guard()
     return render_template_string(ADMIN, k=ADMIN_KEY, msg="",
         pkgs=db().execute("SELECT * FROM pkgs ORDER BY created DESC").fetchall())
 
-@app.route("/admin/add", methods=["POST"])
-def add():
+@app.route("/panel/add", methods=["POST"])
+def panel_add():
     guard()
     num = (request.form.get("num") or gen()).strip()
     with db() as c:
         c.execute("INSERT OR REPLACE INTO pkgs(num,status,origin,dest) VALUES(?,?,?,?)",
                   (num, request.form.get("status") or "Label created",
                    request.form.get("origin") or "-", request.form.get("dest") or "-"))
-    return redirect(url_for("admin", k=ADMIN_KEY))
+    return redirect(url_for("panel", k=ADMIN_KEY))
 
-@app.route("/admin/event", methods=["POST"])
-def add_event():
+@app.route("/panel/event", methods=["POST"])
+def panel_event():
     guard()
     with db() as c:
         c.execute("INSERT INTO events(num,text,loc,[when]) VALUES(?,?,?,?)",
                   (request.form["num"], request.form["text"], request.form["loc"], request.form["when"]))
         if request.form.get("status"):
             c.execute("UPDATE pkgs SET status=? WHERE num=?", (request.form["status"], request.form["num"]))
-    return redirect(url_for("admin", k=ADMIN_KEY))
+    return redirect(url_for("panel", k=ADMIN_KEY))
 
 if __name__ == "__main__": app.run(debug=True)

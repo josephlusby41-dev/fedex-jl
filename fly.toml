@@ -1,4 +1,4 @@
-app = "fedex-clone-jl"
+app = "fedex-jl"
 primary_region = "iad"
 
 [build]
