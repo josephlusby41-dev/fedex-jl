@@ -127,7 +127,7 @@ body{font-family:Arial,Helvetica,sans-serif;color:var(--ink);background:#fff}
 .alert{padding:10px 14px;border-radius:6px;margin:12px 0;font-size:14px}
 .ack-notice{border:1px solid #826031;border-radius:6px;padding:16px;margin:16px 0}
 .ack-notice p{margin:8px 0}
-.service-footer{padding:16px 40px;font-size:14px;color:#555}
+.affiliation{margin:8px 0;font-size:.75rem;color:#666}
 .ok{background:#e8f5e9;color:#2e7d32}.err{background:#fdecea;color:#c00}
 table{width:100%;border-collapse:collapse;font-size:14px}
 td,th{padding:8px;border-bottom:1px solid #eee;text-align:left}
@@ -136,24 +136,30 @@ td,th{padding:8px;border-bottom:1px solid #eee;text-align:left}
 BASE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>%s</title>
 <style>%s</style></head><body>
-<header class="topbar"><div class="brand">FedEx</div>
+<header class="topbar"><div class="brand">{{ service_name }}</div>
 <nav><a href="/">Home</a><a href="/track">Track</a></nav></header>
-%s<footer class="service-footer">Tracking provided by {{ service_name }} · scans maintained by this service, not FedEx.</footer></body></html>"""
+%s</body></html>"""
 
-HOME = BASE % ("Track", CSS, """
+PUBLIC_TITLE = "FedEx Tracking — {{ service_name }}"
+
+HOME = BASE % (PUBLIC_TITLE, CSS, """
 <section class="hero"><h1>Track your shipment</h1>
 <form action="/track" method="post" class="box">
 <input name="num" placeholder="Enter tracking number"><button>Track</button></form>
+<p class="affiliation">Not affiliated with FedEx.</p>
 </section>""")
 
-TRACKPAGE = BASE % ("Track", CSS, """
-<section class="hero"><h1>Track by number</h1>
+TRACKPAGE = BASE % (PUBLIC_TITLE, CSS, """
+<section class="hero">{% if result_lookup %}<p class="affiliation">Not affiliated with FedEx.</p>{% endif %}
+<h1>Track by number</h1>
 <form action="/track" method="post" class="box">
 <input name="num" placeholder="Enter tracking number"><button>Track</button></form>
+{% if not result_lookup %}<p class="affiliation">Not affiliated with FedEx.</p>{% endif %}
 {{ msg|safe }}</section>""")
 
-RESULT = BASE % ("Tracking", CSS, """
-<section class="hero"><h1>Tracking {{p['num']}}</h1>
+RESULT = BASE % (PUBLIC_TITLE, CSS, """
+<section class="hero"><p class="affiliation">Not affiliated with FedEx.</p>
+<h1>Tracking {{p['num']}}</h1>
 <p class="pill">{{p['status']}}</p><p class="meta">{{p['origin']}} → {{p['dest']}}</p>
 {% for message in get_flashed_messages() %}<p class="alert ok" role="status">{{ message }}</p>{% endfor %}
 {% if acknowledgement %}
@@ -177,9 +183,10 @@ ADMIN = BASE % ("Admin", CSS + """
 <p><a href="{{ url_for('home') }}">Back to tracking</a></p>
 {% if error %}<p class="alert err" role="alert">{{ error }}</p>{% endif %}
 <form method="post" action="{{ url_for('set_service_name', k=k) }}" class="box">
-<label for="service-name">Tracking service name</label>
-<input id="service-name" name="service_name" value="{{ service_name }}" maxlength="80" required>
-<button>Save service name</button></form>
+<label for="service-name">Site label</label>
+<input id="service-name" name="service_name" value="{{ service_name }}" maxlength="80" aria-describedby="site-label-hint" required>
+<button>Save site label</button>
+<small id="site-label-hint">Renders in the header and after FedEx Tracking —.</small></form>
 <form method="post" action="{{ url_for('panel_add', k=k) }}" class="box">
 <input id="package-number" name="num" placeholder="Tracking number (blank = auto)">
 <button type="button" id="generate-number">Generate</button>
@@ -332,7 +339,9 @@ def generate(): return {"num": gen()}
 def result(num):
     c = db()
     p = c.execute("SELECT * FROM pkgs WHERE num=?", (num,)).fetchone()
-    if not p: return render_template_string(TRACKPAGE, msg=f'<p class="alert err">No package {escape(num)}</p>')
+    if not p:
+        return render_template_string(TRACKPAGE, result_lookup=True,
+                                      msg=f'<p class="alert err">No package {escape(num)}</p>')
     ev = c.execute("SELECT * FROM events WHERE num=? ORDER BY [when] DESC, id DESC", (num,)).fetchall()
     acknowledgement = ACK_PROMPTS.get(p["ack_prompt"]) if not p["action_cleared"] else None
     return render_template_string(RESULT, p=p, ev=ev, acknowledgement=acknowledgement)
@@ -381,6 +390,8 @@ def set_service_name():
     name = request.form.get("service_name", "").strip()
     if not name or len(name) > 80 or not name.isprintable():
         return render_panel("Enter a service name of 1 to 80 printable characters."), 400
+    if "fedex" in re.sub(r"[^a-z0-9]", "", name.casefold()):
+        return render_panel("Enter your own service name for the site label."), 400
     with db() as c:
         c.execute("""
             INSERT INTO tracking_settings(name,value) VALUES('service_name',?)
