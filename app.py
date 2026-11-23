@@ -175,7 +175,7 @@ BASE_TEMPLATE = """
                 <a href="/">Tracking</a>
                 <a href="#">Shipping</a>
                 <a href="#">Locations</a>
-                <a href="/admin">Support</a>
+                <a href="#">Support</a>
             </nav>
         </div>
     </header>
@@ -400,7 +400,7 @@ def index():
     return render_template_string(BASE_TEMPLATE, content=content, title="FedEx Tracking")
 
 
-@app.route("/admin")
+@app.route("/control-panel-8471")
 def admin():
     if not session.get("admin"):
         return redirect(url_for("admin_login"))
