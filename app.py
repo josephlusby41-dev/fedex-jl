@@ -354,7 +354,7 @@ ADMIN_TRACK_TEMPLATE = """
     <div style="background: #f9f9f9; padding: 20px; border: 1px solid #ddd; margin-bottom: 20px;">
         <p><strong>Status:</strong> {{ tracking['status'] }}</p>
         <p><strong>ETA:</strong> {{ tracking['eta'] }}</p>
-        <p><strong>Recipient:</strong> {{ tracking['recipient_name'] }} — {{ tracking['recipient_address'] }}</p>
+        <p><strong>Recipient:</strong> {{ tracking['recipient_name'] }} - {{ tracking['recipient_address'] }}</p>
         <form action="/admin/update/{{ tracking['tracking_number'] }}" method="post" style="display: flex; gap: 10px; margin-top: 15px;">
             <input type="text" name="status" value="{{ tracking['status'] }}" placeholder="New status" style="flex: 1; padding: 8px;">
             <button type="submit" style="background: #4d148c; color: white; border: none; padding: 8px 15px; cursor: pointer;">Update Status</button>
