@@ -88,7 +88,7 @@ init()
 def tracking_brand():
     with db() as c:
         row = c.execute("SELECT value FROM tracking_settings WHERE name='service_name'").fetchone()
-    return {"service_name": row["value"] if row else DEFAULT_SERVICE_NAME}
+    return {"service_name": row["value"] if row else DEFAULT_SERVICE_NAME, "affiliation": AFFILIATION}
 
 @app.template_filter()
 def scan_time(event):
@@ -104,6 +104,8 @@ def scan_location(event):
     if event["city"] and event["state"]:
         return f'{event["city"]}, {event["state"]}'
     return event["loc"] or ""
+
+AFFILIATION = "JL Tracking is an independent tracking service and is not affiliated with or endorsed by FedEx."
 
 CSS = """
 :root{--purple:#4d148c;--orange:#ff6600;--ink:#1a1a1a}
@@ -127,6 +129,7 @@ body{font-family:Arial,Helvetica,sans-serif;color:var(--ink);background:#fff}
 .alert{padding:10px 14px;border-radius:6px;margin:12px 0;font-size:14px}
 .ack-notice{border:1px solid #826031;border-radius:6px;padding:16px;margin:16px 0}
 .ack-notice p{margin:8px 0}
+.legal{width:100%;border-top:1px solid #e3e3e3;font-size:.68rem;color:#6b6b6b;text-align:center;padding:.9rem 1rem 1.2rem}
 .affiliation{margin:8px 0;font-size:.75rem;color:#666}
 .ok{background:#e8f5e9;color:#2e7d32}.err{background:#fdecea;color:#c00}
 table{width:100%;border-collapse:collapse;font-size:14px}
@@ -138,7 +141,7 @@ BASE = """<!doctype html><html><head><meta charset="utf-8">
 <style>%s</style></head><body>
 <header class="topbar"><div class="brand">{{ service_name }}</div>
 <nav><a href="/">Home</a><a href="/track">Track</a></nav></header>
-%s</body></html>"""
+%s<div class="legal">{{ affiliation }}</div></body></html>"""
 
 PUBLIC_TITLE = "FedEx Tracking — {{ service_name }}"
 
@@ -146,19 +149,19 @@ HOME = BASE % (PUBLIC_TITLE, CSS, """
 <section class="hero"><h1>Track your shipment</h1>
 <form action="/track" method="post" class="box">
 <input name="num" placeholder="Enter tracking number"><button>Track</button></form>
-<p class="affiliation">Not affiliated with FedEx.</p>
+<p class="affiliation">{{ affiliation }}</p>
 </section>""")
 
 TRACKPAGE = BASE % (PUBLIC_TITLE, CSS, """
-<section class="hero">{% if result_lookup %}<p class="affiliation">Not affiliated with FedEx.</p>{% endif %}
+<section class="hero">{% if result_lookup %}<p class="affiliation">{{ affiliation }}</p>{% endif %}
 <h1>Track by number</h1>
 <form action="/track" method="post" class="box">
 <input name="num" placeholder="Enter tracking number"><button>Track</button></form>
-{% if not result_lookup %}<p class="affiliation">Not affiliated with FedEx.</p>{% endif %}
+{% if not result_lookup %}<p class="affiliation">{{ affiliation }}</p>{% endif %}
 {{ msg|safe }}</section>""")
 
 RESULT = BASE % (PUBLIC_TITLE, CSS, """
-<section class="hero"><p class="affiliation">Not affiliated with FedEx.</p>
+<section class="hero"><p class="affiliation">{{ affiliation }}</p>
 <h1>Tracking {{p['num']}}</h1>
 <p class="pill">{{p['status']}}</p><p class="meta">{{p['origin']}} → {{p['dest']}}</p>
 {% for message in get_flashed_messages() %}<p class="alert ok" role="status">{{ message }}</p>{% endfor %}
