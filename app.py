@@ -17,6 +17,21 @@ ADMIN_PASS = os.environ.get("ADMIN_PASS", "Deebaby25!")
 
 CITIES = ["MEMPHIS, TN", "DALLAS, TX", "ATLANTA, GA", "INDIANAPOLIS, IN", "OAKLAND, CA", "GREENVILLE, SC"]
 
+SERVICES = [
+    "FedEx Ground",
+    "FedEx Express Saver",
+    "FedEx 2Day",
+    "FedEx Standard Overnight",
+    "FedEx Priority Overnight",
+    "FedEx First Overnight",
+    "FedEx 2Day AM",
+    "FedEx Home Delivery",
+    "FedEx International Priority",
+    "FedEx International Economy",
+    "FedEx SmartPost",
+    "FedEx Freight"
+]
+
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -24,6 +39,13 @@ def get_db():
 
 def fmt_ts(dt):
     return dt.strftime("%b %d, %Y %I:%M %p").upper()
+
+def parse_dt(date_str, time_str):
+    """Parse date (YYYY-MM-DD) and time (HH:MM) strings into datetime. Falls back to now."""
+    try:
+        return datetime.datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+    except Exception:
+        return datetime.datetime.now()
 
 def add_event_internal(c, tn, dt, location, description, details=""):
     c.execute("""INSERT INTO events (tracking_number, timestamp, location, description, details)
@@ -283,12 +305,23 @@ ADMIN_DASHBOARD_TEMPLATE = """
            <input type="text" name="sender_name" placeholder="Sender Name" style="padding: 8px;" required>
            <input type="text" name="recipient_name" placeholder="Recipient Name" style="padding: 8px;" required>
            <input type="text" name="recipient_address" placeholder="Recipient Address" style="padding: 8px;" required>
-           <input type="text" name="service_type" placeholder="Service Type (e.g. FedEx Ground)" style="padding: 8px;" required>
+           <select name="service_type" style="padding: 8px;" required>
+               {% for s in services %}
+               <option value="{{ s }}">{{ s }}</option>
+               {% endfor %}
+           </select>
            <input type="text" name="weight" placeholder="Weight (e.g. 4.2 lbs)" style="padding: 8px;" required>
            <input type="text" name="pieces" placeholder="Pieces" style="padding: 8px;" required>
            <input type="text" name="reference" placeholder="Reference (auto if blank)" style="padding: 8px;">
            <input type="text" name="origin_city" placeholder="Origin City (e.g. GREENVILLE, SC)" style="padding: 8px;" required>
            <input type="text" name="status" placeholder="Initial Status (e.g. In transit - on time)" style="padding: 8px;" required>
+           <label style="font-size: 13px; color: #555;">Shipment Date &amp; Time</label>
+           <div style="display: flex; gap: 10px;">
+               <input type="date" name="ship_date" value="{{ today }}" style="padding: 8px; flex: 1;">
+               <input type="time" name="ship_time" value="{{ now_time }}" style="padding: 8px; flex: 1;">
+           </div>
+           <label style="font-size: 13px; color: #555;">ETA Date</label>
+           <input type="date" name="eta_date" value="{{ eta_default }}" style="padding: 8px;">
            <div style="grid-column: 1 / -1;">
                <button type="submit" style="width: 100%;">Create Shipment</button>
            </div>
@@ -333,10 +366,24 @@ ADMIN_TRACK_TEMPLATE = """
            <input type="text" name="status" value="{{ tracking['status'] }}" placeholder="New status" style="flex: 1; padding: 8px;">
            <button type="submit" style="background: #4d148c; color: white; border: none; padding: 8px 15px; cursor: pointer;">Update Status</button>
        </form>
+       <form action="/admin/update_eta/{{ tracking['tracking_number'] }}" method="post" style="display: flex; gap: 10px; margin-top: 10px;">
+           <input type="text" name="eta" value="{{ tracking['eta'] }}" placeholder="New ETA (e.g. Nov 25 by 4:30 pm)" style="flex: 1; padding: 8px;">
+           <button type="submit" style="background: #4d148c; color: white; border: none; padding: 8px 15px; cursor: pointer;">Update ETA</button>
+       </form>
    </div>
 
    <h3 style="color: #4d148c;">Add Event</h3>
    <form action="/admin/add_event/{{ tracking['tracking_number'] }}" method="post" style="background: #f9f9f9; padding: 20px; border: 1px solid #ddd; margin-bottom: 30px; display: grid; gap: 10px;">
+       <div style="display: flex; gap: 10px;">
+           <div style="flex: 1;">
+               <label style="font-size: 13px; color: #555;">Event Date</label>
+               <input type="date" name="event_date" value="{{ today }}" style="padding: 8px; width: 100%;">
+           </div>
+           <div style="flex: 1;">
+               <label style="font-size: 13px; color: #555;">Event Time</label>
+               <input type="time" name="event_time" value="{{ now_time }}" style="padding: 8px; width: 100%;">
+           </div>
+       </div>
        <input type="text" name="location" placeholder="Location (e.g. MEMPHIS, TN)" style="padding: 8px;" required>
        <input type="text" name="description" placeholder="Description (e.g. Arrived at FedEx location)" style="padding: 8px;" required>
        <input type="text" name="details" placeholder="Details (optional)" style="padding: 8px;">
@@ -395,7 +442,11 @@ def admin():
     conn = get_db()
     trackings = conn.execute("SELECT * FROM trackings ORDER BY id DESC").fetchall()
     conn.close()
-    content = render_template_string(ADMIN_DASHBOARD_TEMPLATE, trackings=trackings)
+    now = datetime.datetime.now()
+    content = render_template_string(ADMIN_DASHBOARD_TEMPLATE, trackings=trackings,
+                                     services=SERVICES, today=now.strftime("%Y-%m-%d"),
+                                     now_time=now.strftime("%H:%M"),
+                                     eta_default=(now + datetime.timedelta(days=2)).strftime("%Y-%m-%d"))
     return render_template_string(BASE_TEMPLATE, content=content, title="Admin Dashboard")
 
 @app.route("/control-panel-8471/login", methods=["GET", "POST"])
@@ -423,8 +474,16 @@ def admin_create():
     reference = request.form.get("reference", "").strip() or rand_ref()
     city = request.form.get("origin_city", "").strip() or random.choice(CITIES)
     facility = f"FedEx location in {city}"
-    eta = now + datetime.timedelta(days=random.randint(1, 5))
-    eta_str = eta.strftime("%b %d") + " by 4:30 pm"
+    ship_dt = parse_dt(request.form.get("ship_date", ""), request.form.get("ship_time", ""))
+    eta_date = request.form.get("eta_date", "").strip()
+    if eta_date:
+        try:
+            eta_dt = datetime.datetime.strptime(eta_date, "%Y-%m-%d")
+            eta_str = eta_dt.strftime("%b %d") + " by 4:30 pm"
+        except Exception:
+            eta_str = (now + datetime.timedelta(days=2)).strftime("%b %d") + " by 4:30 pm"
+    else:
+        eta_str = (now + datetime.timedelta(days=2)).strftime("%b %d") + " by 4:30 pm"
     conn = get_db()
     c = conn.cursor()
     try:
@@ -434,8 +493,8 @@ def admin_create():
             (tn, request.form.get("sender_name"), request.form.get("recipient_name"),
              request.form.get("recipient_address"), request.form.get("service_type"),
              request.form.get("weight"), request.form.get("pieces"), reference,
-             request.form.get("status"), fmt_ts(now), eta_str))
-        add_event_internal(c, tn, now, city, "Shipment information sent to FedEx",
+             request.form.get("status"), fmt_ts(ship_dt), eta_str))
+        add_event_internal(c, tn, ship_dt, city, "Shipment information sent to FedEx",
                            facility + " - Reference: " + rand_ref())
         conn.commit()
     except sqlite3.IntegrityError:
@@ -451,7 +510,9 @@ def admin_track(tn):
     tracking = conn.execute("SELECT * FROM trackings WHERE tracking_number = ?", (tn,)).fetchone()
     events = conn.execute("SELECT * FROM events WHERE tracking_number = ? ORDER BY id DESC", (tn,)).fetchall()
     conn.close()
-    content = render_template_string(ADMIN_TRACK_TEMPLATE, tracking=tracking, events=events)
+    now = datetime.datetime.now()
+    content = render_template_string(ADMIN_TRACK_TEMPLATE, tracking=tracking, events=events,
+                                     today=now.strftime("%Y-%m-%d"), now_time=now.strftime("%H:%M"))
     return render_template_string(BASE_TEMPLATE, content=content, title="Manage Shipment")
 
 @app.route("/admin/update/<tn>", methods=["POST"])
@@ -464,12 +525,23 @@ def admin_update(tn):
     conn.close()
     return redirect(url_for("admin_track", tn=tn))
 
+@app.route("/admin/update_eta/<tn>", methods=["POST"])
+def admin_update_eta(tn):
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+    conn = get_db()
+    conn.execute("UPDATE trackings SET eta = ? WHERE tracking_number = ?", (request.form.get("eta"), tn))
+    conn.commit()
+    conn.close()
+    return redirect(url_for("admin_track", tn=tn))
+
 @app.route("/admin/add_event/<tn>", methods=["POST"])
 def admin_add_event(tn):
     if not session.get("admin"):
         return redirect(url_for("admin_login"))
+    event_dt = parse_dt(request.form.get("event_date", ""), request.form.get("event_time", ""))
     conn = get_db()
-    add_event_internal(conn.cursor(), tn, datetime.datetime.now(),
+    add_event_internal(conn.cursor(), tn, event_dt,
                        request.form.get("location"), request.form.get("description"),
                        request.form.get("details", ""))
     conn.commit()
