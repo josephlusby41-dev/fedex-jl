@@ -1,12 +1,24 @@
 import os, re, random, string, sqlite3
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from flask import Flask, render_template_string, request, redirect, url_for, abort
+from flask import Flask, render_template_string, request, redirect, url_for, abort, flash
 from markupsafe import escape
+from secrets import token_urlsafe
+from hashlib import sha256
 
 app = Flask(__name__)
 DB = os.environ.get("DB_PATH", "track.db")
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "changeme")
+app.secret_key = sha256(f"tracking-session:{ADMIN_KEY}".encode()).digest()
+app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_SAMESITE="Lax")
+DEFAULT_SERVICE_NAME = "JL Tracking"
+ACK_PROMPTS = {
+    "hold": ("Hold — action required", "This shipment is on hold. Confirm that you have read this tracking update."),
+    "address": ("Address verification needed", "The shipping address needs review. Confirm that you have read this tracking update."),
+    "signature": ("Signature required", "A signature is required at delivery. Confirm that you have read this tracking update."),
+    "reschedule": ("Reschedule requested", "A delivery reschedule has been requested. Confirm that you have read this tracking update."),
+    "clearance": ("Clearance review", "This shipment is under clearance review. Confirm that you have read this tracking update."),
+}
 STATUSES = (
     "Label created", "Picked up", "In transit", "At local facility",
     "Out for delivery", "Delivered", "Exception",
@@ -51,6 +63,14 @@ def init():
         c.execute("""CREATE TABLE IF NOT EXISTS pkgs(
             num TEXT PRIMARY KEY, status TEXT, origin TEXT, dest TEXT,
             created TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        columns = {column["name"] for column in c.execute("PRAGMA table_info(pkgs)")}
+        for column, definition in (
+            ("ack_prompt", "TEXT"), ("action_cleared", "INTEGER NOT NULL DEFAULT 0"),
+            ("ack_token", "TEXT"),
+        ):
+            if column not in columns:
+                c.execute(f"ALTER TABLE pkgs ADD COLUMN {column} {definition}")
+        c.execute("CREATE TABLE IF NOT EXISTS tracking_settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
         c.execute("""CREATE TABLE IF NOT EXISTS events(
             id INTEGER PRIMARY KEY AUTOINCREMENT, num TEXT, [when] TEXT,
             text TEXT, loc TEXT, out_of_order INTEGER NOT NULL DEFAULT 0,
@@ -63,6 +83,12 @@ def init():
                 c.execute(f"ALTER TABLE events ADD COLUMN {column} TEXT")
         c.execute("CREATE INDEX IF NOT EXISTS events_num_when ON events(num, [when])")
 init()
+
+@app.context_processor
+def tracking_brand():
+    with db() as c:
+        row = c.execute("SELECT value FROM tracking_settings WHERE name='service_name'").fetchone()
+    return {"service_name": row["value"] if row else DEFAULT_SERVICE_NAME}
 
 @app.template_filter()
 def scan_time(event):
@@ -99,6 +125,9 @@ body{font-family:Arial,Helvetica,sans-serif;color:var(--ink);background:#fff}
 .ev{padding:12px 0;border-bottom:1px solid #f0f0f0;font-size:14px}
 .ev b{display:block}.ev span{color:#777;font-size:12px}
 .alert{padding:10px 14px;border-radius:6px;margin:12px 0;font-size:14px}
+.ack-notice{border:1px solid #826031;border-radius:6px;padding:16px;margin:16px 0}
+.ack-notice p{margin:8px 0}
+.service-footer{padding:16px 40px;font-size:14px;color:#555}
 .ok{background:#e8f5e9;color:#2e7d32}.err{background:#fdecea;color:#c00}
 table{width:100%;border-collapse:collapse;font-size:14px}
 td,th{padding:8px;border-bottom:1px solid #eee;text-align:left}
@@ -109,7 +138,7 @@ BASE = """<!doctype html><html><head><meta charset="utf-8">
 <style>%s</style></head><body>
 <header class="topbar"><div class="brand">FedEx</div>
 <nav><a href="/">Home</a><a href="/track">Track</a></nav></header>
-%s</body></html>"""
+%s<footer class="service-footer">Tracking provided by {{ service_name }} · scans maintained by this service, not FedEx.</footer></body></html>"""
 
 HOME = BASE % ("Track", CSS, """
 <section class="hero"><h1>Track your shipment</h1>
@@ -126,6 +155,13 @@ TRACKPAGE = BASE % ("Track", CSS, """
 RESULT = BASE % ("Tracking", CSS, """
 <section class="hero"><h1>Tracking {{p['num']}}</h1>
 <p class="pill">{{p['status']}}</p><p class="meta">{{p['origin']}} → {{p['dest']}}</p>
+{% for message in get_flashed_messages() %}<p class="alert ok" role="status">{{ message }}</p>{% endfor %}
+{% if acknowledgement %}
+<section class="ack-notice" aria-labelledby="ack-title">
+<h2 id="ack-title">{{ acknowledgement[0] }}</h2><p>{{ acknowledgement[1] }}</p>
+<form method="post" action="{{ url_for('acknowledge', num=p['num'], token=p['ack_token']) }}">
+<button>Confirm</button></form></section>
+{% endif %}
 <div class="tl">{% for e in ev %}
 <div class="ev"><b>{{e['text']}}</b><span>{{ e | scan_time }}</span>
 {% if e | scan_location %}<div>{{ e | scan_location }}</div>{% endif %}</div>
@@ -140,6 +176,10 @@ ADMIN = BASE % ("Admin", CSS + """
 <section class="hero panel"><h1>Admin</h1>
 <p><a href="{{ url_for('home') }}">Back to tracking</a></p>
 {% if error %}<p class="alert err" role="alert">{{ error }}</p>{% endif %}
+<form method="post" action="{{ url_for('set_service_name', k=k) }}" class="box">
+<label for="service-name">Tracking service name</label>
+<input id="service-name" name="service_name" value="{{ service_name }}" maxlength="80" required>
+<button>Save service name</button></form>
 <form method="post" action="{{ url_for('panel_add', k=k) }}" class="box">
 <input id="package-number" name="num" placeholder="Tracking number (blank = auto)">
 <button type="button" id="generate-number">Generate</button>
@@ -162,7 +202,16 @@ ADMIN = BASE % ("Admin", CSS + """
 <td>{{p['status']}}</td><td>{{p['origin']}}→{{p['dest']}}</td>
 <td{% if p['idle_hours'] is not none and p['idle_hours'] > 48 %} class="warning"{% endif %}>
 {% if p['idle_hours'] is none %}No dated events{% else %}{{ '%0.1f' | format(p['idle_hours']) }} h{% if p['idle_hours'] > 48 %} · Over 48 h{% endif %}{% endif %}</td>
-<td><form method="post" action="{{ url_for('panel_delete', k=k) }}"
+<td><form method="post" action="{{ url_for('set_acknowledgement', k=k, num=p['num']) }}">
+<select name="ack_prompt" aria-label="Acknowledgement prompt">
+<option value="">No acknowledgement</option>
+{% for code, prompt in ack_prompts.items() %}
+<option value="{{ code }}"{% if p['ack_prompt'] == code %} selected{% endif %}>{{ prompt[0] }}</option>
+{% endfor %}</select><button>Save acknowledgement</button></form>
+{% if p['ack_prompt'] %}<p>Acknowledgement · {{ 'cleared' if p['action_cleared'] else 'outstanding' }}</p>
+{% if p['action_cleared'] %}<form method="post" action="{{ url_for('rearm_acknowledgement', k=k, num=p['num']) }}">
+<button>Re-arm acknowledgement</button></form>{% endif %}{% endif %}
+<form method="post" action="{{ url_for('panel_delete', k=k) }}"
 onsubmit="return confirm('Delete this package and all its events?')">
 <input type="hidden" name="num" value="{{ p['num'] }}"><button>Delete package</button>
 </form></td></tr>{% endfor %}</table>{% endif %}
@@ -285,7 +334,59 @@ def result(num):
     p = c.execute("SELECT * FROM pkgs WHERE num=?", (num,)).fetchone()
     if not p: return render_template_string(TRACKPAGE, msg=f'<p class="alert err">No package {escape(num)}</p>')
     ev = c.execute("SELECT * FROM events WHERE num=? ORDER BY [when] DESC, id DESC", (num,)).fetchall()
-    return render_template_string(RESULT, p=p, ev=ev)
+    acknowledgement = ACK_PROMPTS.get(p["ack_prompt"]) if not p["action_cleared"] else None
+    return render_template_string(RESULT, p=p, ev=ev, acknowledgement=acknowledgement)
+
+@app.post("/result/<num>/acknowledge")
+def acknowledge(num):
+    token = request.args.get("token", "")
+    with db() as c:
+        updated = c.execute("""
+            UPDATE pkgs SET action_cleared=1
+            WHERE num=? AND ack_prompt IS NOT NULL AND action_cleared=0 AND ack_token=?
+        """, (num, token)).rowcount
+        if updated:
+            c.execute("INSERT INTO events(num,text,[when]) VALUES(?,?,?)",
+                      (num, "Tracking update acknowledged", event_timestamp("")))
+    if updated:
+        flash("Thanks — updated")
+    return redirect(url_for("result", num=num), code=303)
+
+@app.post("/panel/<num>/acknowledgement")
+def set_acknowledgement(num):
+    guard()
+    prompt = request.form.get("ack_prompt", "")
+    if prompt and prompt not in ACK_PROMPTS:
+        abort(400, "Choose an acknowledgement from the list.")
+    with db() as c:
+        c.execute("""
+            UPDATE pkgs SET ack_prompt=?, action_cleared=0, ack_token=?
+            WHERE num=? AND ack_prompt IS NOT ?
+        """, (prompt or None, token_urlsafe(24) if prompt else None, num, prompt or None))
+    return redirect(url_for("panel", k=ADMIN_KEY), code=303)
+
+@app.post("/panel/<num>/acknowledgement/rearm")
+def rearm_acknowledgement(num):
+    guard()
+    with db() as c:
+        c.execute("""
+            UPDATE pkgs SET action_cleared=0, ack_token=?
+            WHERE num=? AND ack_prompt IS NOT NULL AND action_cleared=1
+        """, (token_urlsafe(24), num))
+    return redirect(url_for("panel", k=ADMIN_KEY), code=303)
+
+@app.post("/panel/service-name")
+def set_service_name():
+    guard()
+    name = request.form.get("service_name", "").strip()
+    if not name or len(name) > 80 or not name.isprintable():
+        return render_panel("Enter a service name of 1 to 80 printable characters."), 400
+    with db() as c:
+        c.execute("""
+            INSERT INTO tracking_settings(name,value) VALUES('service_name',?)
+            ON CONFLICT(name) DO UPDATE SET value=excluded.value
+        """, (name,))
+    return redirect(url_for("panel", k=ADMIN_KEY), code=303)
 
 @app.route("/panel")
 def panel():
@@ -319,7 +420,7 @@ def render_panel(error=None):
         package_scans[package["num"]] = {"status": package["status"], "locations": locations}
     return render_template_string(ADMIN, k=ADMIN_KEY, pkgs=pkgs, events=events,
                                   statuses=STATUSES, states=STATE_ZONES, state_zones=STATE_ZONES,
-                                  package_scans=package_scans, error=error)
+                                  package_scans=package_scans, error=error, ack_prompts=ACK_PROMPTS)
 
 @app.route("/panel/add", methods=["POST"])
 def panel_add():
