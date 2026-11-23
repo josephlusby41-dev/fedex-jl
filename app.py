@@ -1,5 +1,6 @@
 import os, re, random, string, sqlite3
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from flask import Flask, render_template_string, request, redirect, url_for, abort
 from markupsafe import escape
 
@@ -11,6 +12,33 @@ STATUSES = (
     "Out for delivery", "Delivered", "Exception",
 )
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M"
+STATE_ZONES = {
+    "AK": "America/Anchorage", "AL": "America/Chicago",
+    "AR": "America/Chicago", "AZ": "America/Phoenix",
+    "CA": "America/Los_Angeles", "CO": "America/Denver",
+    "CT": "America/New_York", "DE": "America/New_York",
+    "FL": "America/New_York", "GA": "America/New_York",
+    "HI": "Pacific/Honolulu", "IA": "America/Chicago",
+    "ID": "America/Boise", "IL": "America/Chicago",
+    "IN": "America/Indiana/Indianapolis", "KS": "America/Chicago",
+    "KY": "America/New_York", "LA": "America/Chicago",
+    "MA": "America/New_York", "MD": "America/New_York",
+    "ME": "America/New_York", "MI": "America/Detroit",
+    "MN": "America/Chicago", "MO": "America/Chicago",
+    "MS": "America/Chicago", "MT": "America/Denver",
+    "NC": "America/New_York", "ND": "America/Chicago",
+    "NE": "America/Chicago", "NH": "America/New_York",
+    "NJ": "America/New_York", "NM": "America/Denver",
+    "NV": "America/Los_Angeles", "NY": "America/New_York",
+    "OH": "America/New_York", "OK": "America/Chicago",
+    "OR": "America/Los_Angeles", "PA": "America/New_York",
+    "RI": "America/New_York", "SC": "America/New_York",
+    "SD": "America/Chicago", "TN": "America/Chicago",
+    "TX": "America/Chicago", "UT": "America/Denver",
+    "VA": "America/New_York", "VT": "America/New_York",
+    "WA": "America/Los_Angeles", "WI": "America/Chicago",
+    "WV": "America/New_York", "WY": "America/Denver",
+}
 
 def db():
     c = sqlite3.connect(DB)
@@ -25,12 +53,31 @@ def init():
             created TEXT DEFAULT CURRENT_TIMESTAMP)""")
         c.execute("""CREATE TABLE IF NOT EXISTS events(
             id INTEGER PRIMARY KEY AUTOINCREMENT, num TEXT, [when] TEXT,
-            text TEXT, loc TEXT, out_of_order INTEGER NOT NULL DEFAULT 0)""")
+            text TEXT, loc TEXT, out_of_order INTEGER NOT NULL DEFAULT 0,
+            city TEXT, state TEXT, tz TEXT)""")
         columns = {column["name"] for column in c.execute("PRAGMA table_info(events)")}
         if "out_of_order" not in columns:
             c.execute("ALTER TABLE events ADD COLUMN out_of_order INTEGER NOT NULL DEFAULT 0")
+        for column in ("city", "state", "tz"):
+            if column not in columns:
+                c.execute(f"ALTER TABLE events ADD COLUMN {column} TEXT")
         c.execute("CREATE INDEX IF NOT EXISTS events_num_when ON events(num, [when])")
 init()
+
+@app.template_filter()
+def scan_time(event):
+    if not event["tz"]:
+        return f'{event["when"]} UTC'
+    instant = datetime.strptime(event["when"], TIMESTAMP_FORMAT).replace(tzinfo=timezone.utc)
+    local = instant.astimezone(ZoneInfo(event["tz"]))
+    offset = local.strftime("%z")
+    return f'{local:%a %d %b, %H:%M} local (UTC{offset[:3]}:{offset[3:]})'
+
+@app.template_filter()
+def scan_location(event):
+    if event["city"] and event["state"]:
+        return f'{event["city"]}, {event["state"]}'
+    return event["loc"] or ""
 
 CSS = """
 :root{--purple:#4d148c;--orange:#ff6600;--ink:#1a1a1a}
@@ -80,7 +127,8 @@ RESULT = BASE % ("Tracking", CSS, """
 <section class="hero"><h1>Tracking {{p['num']}}</h1>
 <p class="pill">{{p['status']}}</p><p class="meta">{{p['origin']}} → {{p['dest']}}</p>
 <div class="tl">{% for e in ev %}
-<div class="ev"><b>{{e['text']}}</b><span>{{e['when']}} · {{e['loc']}}</span></div>
+<div class="ev"><b>{{e['text']}}</b><span>{{ e | scan_time }}</span>
+{% if e | scan_location %}<div>{{ e | scan_location }}</div>{% endif %}</div>
 {% else %}<div class="ev">No activity yet.</div>{% endfor %}</div></section>""")
 
 ADMIN = BASE % ("Admin", CSS + """
@@ -89,6 +137,7 @@ ADMIN = BASE % ("Admin", CSS + """
 """, """
 <section class="hero panel"><h1>Admin</h1>
 <p><a href="{{ url_for('home') }}">Back to tracking</a></p>
+{% if error %}<p class="alert err" role="alert">{{ error }}</p>{% endif %}
 <form method="post" action="{{ url_for('panel_add', k=k) }}" class="box">
 <input id="package-number" name="num" placeholder="Tracking number (blank = auto)">
 <button type="button" id="generate-number">Generate</button>
@@ -100,9 +149,14 @@ ADMIN = BASE % ("Admin", CSS + """
 {% if pkgs %}<h3 style="margin:24px 0 8px">Packages</h3>
 <table><tr><th>Number</th><th>Status</th><th>Route</th><th>Since newest event</th><th>Actions</th></tr>
 {% for p in pkgs %}<tr><td><a href="{{ url_for('result', num=p['num']) }}">{{p['num']}}</a>
-{% for event in warnings.get(p['num'], ()) %}
-<div class="warning">{{ event['when'] }} · {{ event['text'] }} · Saved out of order</div>
-{% endfor %}</td>
+{% set scans = events.get(p['num'], ()) %}
+{% if scans %}<details><summary>Scans ({{ scans | length }})</summary>
+{% for event in scans %}
+<div class="ev"><b>{{ event['text'] }}</b>{{ event | scan_time }}
+{% if event | scan_location %}<div>{{ event | scan_location }}</div>{% endif %}
+{% if event['tz'] %}<small>{{ event['when'] }} UTC</small>{% endif %}
+{% if event['out_of_order'] %}<div class="warning">Saved out of order</div>{% endif %}</div>
+{% endfor %}</details>{% endif %}</td>
 <td>{{p['status']}}</td><td>{{p['origin']}}→{{p['dest']}}</td>
 <td{% if p['idle_hours'] is not none and p['idle_hours'] > 48 %} class="warning"{% endif %}>
 {% if p['idle_hours'] is none %}No dated events{% else %}{{ '%0.1f' | format(p['idle_hours']) }} h{% if p['idle_hours'] > 48 %} · Over 48 h{% endif %}{% endif %}</td>
@@ -114,7 +168,9 @@ onsubmit="return confirm('Delete this package and all its events?')">
 <form method="post" action="{{ url_for('panel_event', k=k) }}" class="box">
 <input name="num" placeholder="Tracking number" required>
 <input name="text" placeholder="Event text (e.g. Customs clearance)" required>
-<input name="loc" placeholder="Location" required>
+<input name="city" aria-label="City" placeholder="City">
+<select name="state" aria-label="State"><option value="">State</option>
+{% for state in states %}<option>{{ state }}</option>{% endfor %}</select>
 <input name="when" aria-label="Timestamp in UTC" placeholder="YYYY-MM-DD HH:MM (blank = now)">
 <select name="status" aria-label="New status"><option value="">Keep current status</option>
 {% for status in statuses %}<option>{{ status }}</option>{% endfor %}</select>
@@ -176,12 +232,15 @@ def result(num):
     c = db()
     p = c.execute("SELECT * FROM pkgs WHERE num=?", (num,)).fetchone()
     if not p: return render_template_string(TRACKPAGE, msg=f'<p class="alert err">No package {escape(num)}</p>')
-    ev = c.execute("SELECT * FROM events WHERE num=? ORDER BY [when] DESC", (num,)).fetchall()
+    ev = c.execute("SELECT * FROM events WHERE num=? ORDER BY [when] DESC, id DESC", (num,)).fetchall()
     return render_template_string(RESULT, p=p, ev=ev)
 
 @app.route("/panel")
 def panel():
     guard()
+    return render_panel()
+
+def render_panel(error=None):
     with db() as c:
         pkgs = c.execute("""
             SELECT p.*, MAX(0, (julianday('now') - (
@@ -189,11 +248,11 @@ def panel():
             )) * 24) AS idle_hours
             FROM pkgs p ORDER BY p.created DESC
         """).fetchall()
-        warnings = {}
-        for event in c.execute("SELECT * FROM events WHERE out_of_order=1 ORDER BY [when] DESC"):
-            warnings.setdefault(event["num"], []).append(event)
+        events = {}
+        for event in c.execute("SELECT * FROM events ORDER BY [when] DESC, id DESC"):
+            events.setdefault(event["num"], []).append(event)
     return render_template_string(ADMIN, k=ADMIN_KEY, pkgs=pkgs,
-                                  warnings=warnings, statuses=STATUSES)
+                                  events=events, statuses=STATUSES, states=STATE_ZONES, error=error)
 
 @app.route("/panel/add", methods=["POST"])
 def panel_add():
@@ -223,16 +282,32 @@ def panel_event():
     status = request.form.get("status", "")
     if status and status not in STATUSES:
         abort(400, "Choose a status from the list.")
+    city = request.form.get("city", "").strip()
+    state = request.form.get("state", "").strip().upper()
+    if (city or state) and (not city or state not in STATE_ZONES):
+        return render_panel("Enter a city and select a state, or leave both blank to reuse the last location."), 400
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
         if not c.execute("SELECT 1 FROM pkgs WHERE num=?", (num,)).fetchone():
             abort(404, "Package not found.")
+        if city:
+            tz = STATE_ZONES[state]
+        else:
+            prior = c.execute("""
+                SELECT city, state, tz FROM events
+                WHERE num=? AND city IS NOT NULL AND state IS NOT NULL AND tz IS NOT NULL
+                ORDER BY [when] DESC, id DESC LIMIT 1
+            """, (num,)).fetchone()
+            if prior is None:
+                return render_panel("Enter a city and state for the first scan with a location."), 400
+            city, state, tz = prior
         out_of_order = c.execute(
             "SELECT EXISTS(SELECT 1 FROM events WHERE num=? AND julianday([when]) > julianday(?))",
             (num, when),
         ).fetchone()[0]
-        c.execute("INSERT INTO events(num,text,loc,[when],out_of_order) VALUES(?,?,?,?,?)",
-                  (num, request.form["text"], request.form["loc"], when, out_of_order))
+        c.execute("""
+            INSERT INTO events(num,text,loc,[when],out_of_order,city,state,tz) VALUES(?,?,?,?,?,?,?,?)
+        """, (num, request.form["text"], f"{city}, {state}", when, out_of_order, city, state, tz))
         if status:
             c.execute("UPDATE pkgs SET status=? WHERE num=?", (status, num))
     return redirect(url_for("panel", k=ADMIN_KEY))
