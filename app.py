@@ -11,7 +11,7 @@ app.secret_key = os.environ.get("SECRET_KEY", "super-secret-key-change-this")
 # Database configuration
 DB_PATH = os.environ.get("DB_PATH", "/tmp/fedex.db")
 
-# Admin credentials (Change these in your Render Environment Variables for security)
+# Admin credentials
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "Deebaby25!")
 
@@ -36,11 +36,8 @@ def init_db():
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
-    
     conn = get_db()
     c = conn.cursor()
-    
-    # Create tables if they don't exist
     c.execute("""CREATE TABLE IF NOT EXISTS trackings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tracking_number TEXT UNIQUE,
@@ -55,7 +52,6 @@ def init_db():
         created_at TEXT,
         eta TEXT
     )""")
-    
     c.execute("""CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tracking_number TEXT,
@@ -64,33 +60,26 @@ def init_db():
         description TEXT,
         details TEXT
     )""")
-    
     c.execute("CREATE INDEX IF NOT EXISTS idx_events_tn ON events(tracking_number)")
     conn.commit()
     conn.close()
-    
-    # Seed demo data if table is empty
     seed_demo_data()
 
 def seed_demo_data():
     conn = get_db()
     c = conn.cursor()
     count = c.execute("SELECT COUNT(*) FROM trackings").fetchone()[0]
-    
     if count == 0:
         now = datetime.datetime.now()
         tn = "123456789012"
         eta = now + datetime.timedelta(days=2)
         eta_str = eta.strftime("%b %d") + " by 4:30 pm"
-        
         c.execute("""INSERT INTO trackings 
             (tracking_number, sender_name, recipient_name, recipient_address, service_type, weight, pieces, reference, status, created_at, eta) 
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (tn, "ACME WIDGETS LLC", "JOSEPH LUSBY", "1420 MAPLE ST, AUSTIN TX 78701",
              "FedEx Ground", "4.2 lbs", "1", "PO-88213", "In transit - on time",
-             fmt_ts(now), eta_str)
-        )
-        
+             fmt_ts(now), eta_str))
         add_event_internal(c, tn, now - datetime.timedelta(hours=6), "DALLAS, TX", "Picked up", "Tendered at FedEx origin facility")
         add_event_internal(c, tn, now - datetime.timedelta(hours=3), "DALLAS, TX", "In transit", "Departed FedEx location")
         conn.commit()
@@ -125,67 +114,96 @@ BASE_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{ title }}</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%234d148c'/><text x='16' y='22' font-size='14' font-style='italic' font-weight='bold' text-anchor='middle' fill='white' font-family='Arial'>Fx</text></svg>">
     <style>
-        body { font-family: 'Roboto', Arial, sans-serif; margin: 0; padding: 0; background-color: #f2f2f2; color: #333; }
-        header { background-color: #4d148c; color: white; padding: 15px 0; }
+        * { box-sizing: border-box; }
+        body { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; margin: 0; padding: 0; background-color: #f2f2f2; color: #333; }
+        a { color: #4d148c; }
+        .topbar { background: #4d148c; height: 6px; }
+        header { background-color: #ffffff; border-bottom: 1px solid #e5e5e5; padding: 0; }
         .container { max-width: 1000px; margin: 0 auto; padding: 0 20px; }
-        .header-content { display: flex; justify-content: space-between; align-items: center; }
-        .logo { font-size: 24px; font-weight: bold; letter-spacing: -1px; }
-        .logo span { color: #ff6600; }
-        nav a { color: white; text-decoration: none; margin-left: 20px; font-size: 14px; font-weight: 500; }
-        nav a:hover { text-decoration: underline; }
-        
-        .main-content { background: white; min-height: 400px; padding: 40px 20px; margin-top: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); }
-        
+        .header-content { display: flex; justify-content: space-between; align-items: center; padding: 14px 0; }
+        .logo { font-size: 30px; font-weight: 800; letter-spacing: -2px; font-style: italic; }
+        .logo .fed { color: #4d148c; }
+        .logo .ex { color: #ff6600; }
+        .logo small { display: block; font-size: 9px; font-style: normal; letter-spacing: 2px; color: #666; text-transform: uppercase; margin-top: -2px; }
+        nav { background: #4d148c; }
+        nav .container { display: flex; }
+        nav a { color: white; text-decoration: none; padding: 12px 18px; font-size: 14px; font-weight: 600; display: block; }
+        nav a:hover { background: #3a0f6b; }
+        nav a.active { background: #ff6600; }
+        .main-content { background: white; min-height: 400px; padding: 40px 20px; margin-top: 20px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
         .search-box { text-align: center; margin-bottom: 30px; }
-        .search-box h1 { font-size: 28px; margin-bottom: 20px; color: #333; }
+        .search-box h1 { font-size: 26px; margin-bottom: 6px; color: #333; font-weight: 600; }
+        .search-box .sub { color: #777; font-size: 14px; margin-bottom: 24px; }
         .input-group { display: inline-flex; gap: 10px; }
-        input[type="text"] { padding: 12px 15px; width: 300px; border: 1px solid #ccc; border-radius: 4px; font-size: 16px; }
-        button { background-color: #ff6600; color: white; border: none; padding: 12px 25px; font-size: 16px; font-weight: bold; border-radius: 4px; cursor: pointer; }
+        input[type="text"] { padding: 12px 15px; width: 320px; border: 1px solid #bbb; border-radius: 3px; font-size: 16px; }
+        input[type="text"]:focus { outline: none; border-color: #4d148c; box-shadow: 0 0 0 2px rgba(77,20,140,0.15); }
+        button { background-color: #ff6600; color: white; border: none; padding: 12px 28px; font-size: 15px; font-weight: bold; border-radius: 3px; cursor: pointer; }
         button:hover { background-color: #e55b00; }
-        
-        .error-msg { background-color: #fcebeb; border: 1px solid #f5c6cb; color: #721c24; padding: 15px; border-radius: 4px; margin-top: 20px; text-align: left; max-width: 600px; margin-left: auto; margin-right: auto; }
-        
-        .result-card { max-width: 800px; margin: 0 auto; border: 1px solid #ddd; background: #fff; }
-        .result-header { padding: 20px; border-bottom: 1px solid #eee; }
-        .result-header h2 { margin: 0; font-size: 20px; color: #4d148c; }
-        .result-header .status { font-size: 18px; font-weight: bold; color: #333; margin-top: 5px; }
-        .result-header .eta { font-size: 14px; color: #666; margin-top: 5px; }
-        
-        .result-details { padding: 20px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; font-size: 14px; }
-        .detail-col strong { display: block; color: #666; font-size: 12px; margin-bottom: 4px; }
-        
-        .timeline { padding: 20px; }
-        .timeline h3 { font-size: 14px; text-transform: uppercase; color: #666; margin-bottom: 15px; letter-spacing: 1px; }
+        .error-msg { background-color: #fdf2f2; border-left: 4px solid #cc0000; color: #721c24; padding: 15px 18px; border-radius: 3px; margin-top: 20px; text-align: left; max-width: 600px; margin-left: auto; margin-right: auto; font-size: 14px; }
+        .result-card { max-width: 820px; margin: 0 auto; border: 1px solid #ddd; background: #fff; }
+        .result-header { padding: 22px; border-bottom: 1px solid #eee; background: #fafafa; }
+        .result-header h2 { margin: 0; font-size: 16px; color: #666; font-weight: 500; }
+        .result-header .status { font-size: 20px; font-weight: 700; color: #333; margin-top: 4px; }
+        .result-header .eta { font-size: 14px; color: #666; margin-top: 4px; }
+        .progress-bar { display: flex; gap: 4px; padding: 0 22px 16px; background: #fafafa; }
+        .progress-bar span { flex: 1; height: 5px; background: #ddd; border-radius: 3px; }
+        .progress-bar span.on { background: #ff6600; }
+        .progress-labels { display: flex; justify-content: space-between; max-width: 820px; margin: 0 auto; padding: 6px 22px 0; font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: .5px; }
+        .result-details { padding: 20px 22px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 20px; font-size: 14px; }
+        .detail-col strong { display: block; color: #999; font-size: 11px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .5px; }
+        .timeline { padding: 22px; }
+        .timeline h3 { font-size: 13px; text-transform: uppercase; color: #666; margin-bottom: 15px; letter-spacing: 1px; }
         .event { display: flex; gap: 20px; padding-bottom: 15px; margin-bottom: 15px; border-bottom: 1px solid #f0f0f0; }
         .event:last-child { border-bottom: none; }
-        .event-time { min-width: 140px; font-size: 13px; color: #666; }
+        .event-time { min-width: 150px; font-size: 13px; color: #666; }
         .event-info { flex: 1; }
         .event-desc { font-weight: bold; font-size: 14px; color: #333; }
         .event-loc { font-size: 13px; color: #666; margin-top: 2px; }
-        
-        footer { text-align: center; padding: 20px; font-size: 12px; color: #666; margin-top: 40px; }
+        .disclaimer { max-width: 820px; margin: 24px auto 0; font-size: 12px; color: #888; line-height: 1.5; }
+        footer { background: #4d148c; color: #fff; margin-top: 40px; }
+        footer .fcontainer { max-width: 1000px; margin: 0 auto; padding: 26px 20px; }
+        footer .flinks { display: flex; flex-wrap: wrap; gap: 8px 24px; font-size: 13px; margin-bottom: 18px; }
+        footer .flinks a { color: #fff; text-decoration: none; opacity: .9; }
+        footer .flinks a:hover { text-decoration: underline; }
+        footer .tagline { font-size: 13px; opacity: .7; }
+        footer .legal { font-size: 11px; opacity: .6; margin-top: 10px; line-height: 1.6; }
     </style>
 </head>
 <body>
+    <div class="topbar"></div>
     <header>
         <div class="container header-content">
-            <div class="logo">Fed<span>Ex</span></div>
-            <nav>
-                <a href="/">Tracking</a>
-                <a href="#">Shipping</a>
-                <a href="#">Locations</a>
-                <a href="#">Support</a>
-            </nav>
+            <div class="logo"><span class="fed">Fed</span><span class="ex">Ex</span><small>Tracking</small></div>
         </div>
     </header>
+    <nav>
+        <div class="container">
+            <a href="/" class="active">TRACKING</a>
+            <a href="#">SHIPPING</a>
+            <a href="#">LOCATIONS</a>
+            <a href="#">SUPPORT</a>
+        </div>
+    </nav>
 
     <div class="container main-content">
         {{ content | safe }}
     </div>
 
     <footer>
-        &copy; 1995-2026 FedEx. All rights reserved.
+        <div class="fcontainer">
+            <div class="flinks">
+                <a href="#">About FedEx</a>
+                <a href="#">Careers</a>
+                <a href="#">Privacy &amp; Security</a>
+                <a href="#">Terms of Use</a>
+                <a href="#">Site Map</a>
+                <a href="#">Contact Us</a>
+            </div>
+            <div class="tagline">FedEx. Solutions that matter.</div>
+            <div class="legal">&copy; 1995-2026 FedEx. All rights reserved. This site is protected by reCAPTCHA and the Google Privacy Policy and Terms of Service apply.</div>
+        </div>
     </footer>
 </body>
 </html>
@@ -194,9 +212,10 @@ BASE_TEMPLATE = """
 INDEX_TEMPLATE = """
 <div class="search-box">
     <h1>Track Your Shipment</h1>
+    <div class="sub">Enter your tracking number to see the latest status of your shipment.</div>
     <form action="/" method="post" class="input-group">
-        <input type="text" name="tracking_number" value="{{ tn }}" placeholder="Enter tracking number" required>
-        <button type="submit">TRACK SHIPMENT</button>
+        <input type="text" name="tracking_number" value="{{ tn }}" placeholder="Enter tracking number" required autofocus>
+        <button type="submit">TRACK</button>
     </form>
 </div>
 
@@ -209,31 +228,35 @@ INDEX_TEMPLATE = """
 {% if tracking %}
 <div class="result-card">
     <div class="result-header">
-        <h2>{{ tracking['tracking_number'] }}</h2>
+        <h2>Tracking Number: {{ tracking['tracking_number'] }}</h2>
         <div class="status">{{ tracking['status'] }}</div>
         <div class="eta">Estimated Delivery: <strong>{{ tracking['eta'] }}</strong></div>
     </div>
-    
+    <div class="progress-bar">
+        <span class="{% if 'Delivered' in tracking['status'] %}on{% endif %}"></span>
+        <span class="{% if 'Out for delivery' in tracking['status'] or 'Delivered' in tracking['status'] %}on{% endif %}"></span>
+        <span class="{% if 'Delivered' in tracking['status'] %}on{% endif %}"></span>
+    </div>
+    <div class="progress-labels"><span>In Transit</span><span>Out for Delivery</span><span>Delivered</span></div>
     <div class="result-details">
         <div class="detail-col">
-            <strong>FROM</strong>
+            <strong>From</strong>
             {{ tracking['sender_name'] }}
         </div>
         <div class="detail-col">
-            <strong>TO</strong>
+            <strong>To</strong>
             {{ tracking['recipient_name'] }}<br>
             {{ tracking['recipient_address'] }}
         </div>
         <div class="detail-col">
-            <strong>SERVICE</strong>
+            <strong>Service</strong>
             {{ tracking['service_type'] }}
         </div>
         <div class="detail-col">
-            <strong>WEIGHT</strong>
+            <strong>Weight</strong>
             {{ tracking['weight'] }}
         </div>
     </div>
-    
     <div class="timeline">
         <h3>Travel History</h3>
         {% for e in events %}
@@ -241,11 +264,14 @@ INDEX_TEMPLATE = """
             <div class="event-time">{{ e['timestamp'] }}</div>
             <div class="event-info">
                 <div class="event-desc">{{ e['description'] }}</div>
-                <div class="event-loc">{{ e['location'] }}{% if e['details'] %} — {{ e['details'] }}{% endif %}</div>
+                <div class="event-loc">{{ e['location'] }}{% if e['details'] %} - {{ e['details'] }}{% endif %}</div>
             </div>
         </div>
         {% endfor %}
     </div>
+</div>
+<div class="disclaimer">
+    Shipment tracking information is provided as a convenience. Delivery times are estimates and not guaranteed. For assistance, contact FedEx Customer Service at 1-800-GoFedEx.
 </div>
 {% endif %}
 """
@@ -274,9 +300,8 @@ ADMIN_DASHBOARD_TEMPLATE = """
 <div style="max-width: 900px; margin: 0 auto;">
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
         <h2 style="margin: 0; color: #4d148c;">Admin Dashboard</h2>
-        <a href="/admin/logout" style="color: #666; text-decoration: none; font-size: 14px;">Logout</a>
+        <a href="/control-panel-8471/logout" style="color: #666; text-decoration: none; font-size: 14px;">Logout</a>
     </div>
-    
     <div style="background: #f9f9f9; padding: 20px; border: 1px solid #ddd; margin-bottom: 30px;">
         <h3 style="margin-top: 0;">Create New Shipment</h3>
         <form action="/admin/create" method="post" style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
@@ -310,8 +335,7 @@ ADMIN_DASHBOARD_TEMPLATE = """
             </div>
         </form>
     </div>
-
-       <h3>Existing Shipments</h3>
+    <h3>Existing Shipments</h3>
     <table style="width: 100%; border-collapse: collapse; background: white; border: 1px solid #ddd;">
         <thead>
             <tr style="background: #4d148c; color: white; text-align: left;">
@@ -343,19 +367,17 @@ ADMIN_DASHBOARD_TEMPLATE = """
 
 ADMIN_TRACK_TEMPLATE = """
 <div style="max-width: 900px; margin: 0 auto;">
-    <a href="/admin" style="color: #4d148c; text-decoration: none; font-size: 14px;">&larr; Back to Dashboard</a>
+    <a href="/control-panel-8471" style="color: #4d148c; text-decoration: none; font-size: 14px;">&larr; Back to Dashboard</a>
     <h2 style="color: #4d148c;">Manage: {{ tracking['tracking_number'] }}</h2>
-
     <div style="background: #f9f9f9; padding: 20px; border: 1px solid #ddd; margin-bottom: 20px;">
         <p><strong>Status:</strong> {{ tracking['status'] }}</p>
         <p><strong>ETA:</strong> {{ tracking['eta'] }}</p>
-        <p><strong>Recipient:</strong> {{ tracking['recipient_name'] }} — {{ tracking['recipient_address'] }}</p>
+        <p><strong>Recipient:</strong> {{ tracking['recipient_name'] }} - {{ tracking['recipient_address'] }}</p>
         <form action="/admin/update/{{ tracking['tracking_number'] }}" method="post" style="display: flex; gap: 10px; margin-top: 15px;">
             <input type="text" name="status" value="{{ tracking['status'] }}" placeholder="New status" style="flex: 1; padding: 8px;">
             <button type="submit" style="background: #4d148c; color: white; border: none; padding: 8px 15px; cursor: pointer;">Update Status</button>
         </form>
     </div>
-
     <h3 style="color: #4d148c;">Add Event</h3>
     <form action="/admin/add_event/{{ tracking['tracking_number'] }}" method="post" style="background: #f9f9f9; padding: 20px; border: 1px solid #ddd; margin-bottom: 30px; display: grid; gap: 10px;">
         <input type="text" name="location" placeholder="Location (e.g. MEMPHIS, TN)" style="padding: 8px;" required>
@@ -363,12 +385,11 @@ ADMIN_TRACK_TEMPLATE = """
         <input type="text" name="details" placeholder="Details (optional)" style="padding: 8px;">
         <button type="submit" style="background: #ff6600; color: white; border: none; padding: 10px; cursor: pointer; font-weight: bold;">Add Event</button>
     </form>
-
     <h3 style="color: #4d148c;">Shipment Events</h3>
     <div style="background: white; border: 1px solid #ddd; padding: 20px;">
         {% for e in events %}
         <div style="padding: 10px 0; border-bottom: 1px solid #f0f0f0;">
-            <strong>{{ e['timestamp'] }}</strong> — {{ e['description'] }} ({{ e['location'] }})
+            <strong>{{ e['timestamp'] }}</strong> - {{ e['description'] }} ({{ e['location'] }})
             {% if e['details'] %}<br><small style="color: #666;">{{ e['details'] }}</small>{% endif %}
         </div>
         {% endfor %}
@@ -393,12 +414,12 @@ def index():
                 "SELECT * FROM events WHERE tracking_number = ? ORDER BY id DESC", (tn.strip(),)
             ).fetchall()
         else:
-            error = "Tracking number not found. Please check the number and try again. If your shipment was recently created, it may take a few minutes to appear in the system."
+            error = "We could not find a shipment matching this tracking number. Please check the number and try again."
         conn.close()
 
+    title = "Tracking Results | FedEx" if tracking else "Tracking | FedEx"
     content = render_template_string(INDEX_TEMPLATE, tracking=tracking, events=events, error=error, tn=tn)
-    return render_template_string(BASE_TEMPLATE, content=content, title="FedEx Tracking")
-
+    return render_template_string(BASE_TEMPLATE, content=content, title=title)
 
 @app.route("/control-panel-8471")
 def admin():
@@ -410,8 +431,7 @@ def admin():
     content = render_template_string(ADMIN_DASHBOARD_TEMPLATE, trackings=trackings)
     return render_template_string(BASE_TEMPLATE, content=content, title="Admin Dashboard")
 
-
-@app.route("/admin/login", methods=["GET", "POST"])
+@app.route("/control-panel-8471/login", methods=["GET", "POST"])
 def admin_login():
     error = None
     if request.method == "POST":
@@ -422,12 +442,10 @@ def admin_login():
     content = render_template_string(ADMIN_LOGIN_TEMPLATE, error=error)
     return render_template_string(BASE_TEMPLATE, content=content, title="Admin Login")
 
-
-@app.route("/admin/logout")
+@app.route("/control-panel-8471/logout")
 def admin_logout():
     session.pop("admin", None)
     return redirect(url_for("admin_login"))
-
 
 @app.route("/admin/create", methods=["POST"])
 def admin_create():
@@ -460,13 +478,12 @@ def admin_create():
              eta_str)
         )
         add_event_internal(c, tn, now, city, "Shipment information sent to FedEx",
-                           f"{facility} — Reference: {rand_ref()}")
+                           facility + " - Reference: " + rand_ref())
         conn.commit()
     except sqlite3.IntegrityError:
         pass
     conn.close()
     return redirect(url_for("admin"))
-
 
 @app.route("/admin/track/<tn>")
 def admin_track(tn):
@@ -481,7 +498,6 @@ def admin_track(tn):
     content = render_template_string(ADMIN_TRACK_TEMPLATE, tracking=tracking, events=events)
     return render_template_string(BASE_TEMPLATE, content=content, title="Manage Shipment")
 
-
 @app.route("/admin/update/<tn>", methods=["POST"])
 def admin_update(tn):
     if not session.get("admin"):
@@ -493,7 +509,6 @@ def admin_update(tn):
         conn.commit()
         conn.close()
     return redirect(url_for("admin_track", tn=tn))
-
 
 @app.route("/admin/add_event/<tn>", methods=["POST"])
 def admin_add_event(tn):
@@ -507,7 +522,6 @@ def admin_add_event(tn):
         request.form.get("details", "")
     )
     return redirect(url_for("admin_track", tn=tn))
-
 
 @app.route("/admin/advance/<tn>", methods=["POST"])
 def admin_advance(tn):
@@ -536,14 +550,13 @@ def admin_advance(tn):
         now = datetime.datetime.now()
         city, facility = random.choice(CITIES)
         c.execute("UPDATE trackings SET status = ? WHERE tracking_number = ?", (new_status, tn))
-        details = "Delivered — Signed for by: FRONT DESK" if new_status == "Delivered" else facility
+        details = "Delivered - Signed for by: FRONT DESK" if new_status == "Delivered" else facility
         add_event_internal(c, tn, now, city, new_status, details)
         if new_status == "Delivered":
             c.execute("UPDATE trackings SET eta = ? WHERE tracking_number = ?", ("Delivered " + fmt_ts(now), tn))
         conn.commit()
     conn.close()
     return redirect(url_for("admin"))
-
 
 # Initialize database on startup
 init_db()
