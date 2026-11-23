@@ -75,7 +75,7 @@ def seed_demo_data():
         c.execute("""INSERT INTO trackings
             (tracking_number, sender_name, recipient_name, recipient_address, service_type, weight, pieces, reference, status, created_at, eta)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (tn, "ACME WIDGETS LLC", "JOSEPH LUSBY", "1420 MAPLE ST, AUSTIN TX 78701",
+            (tn, "ACME WIDGETS LLC", "MICHAEL HARRIS", "2814 OAK LN, AUSTIN TX 78704",
              "FedEx Ground", "4.2 lbs", "1", "PO-88213", "In transit - on time",
              fmt_ts(now), eta_str))
         add_event_internal(c, tn, now - datetime.timedelta(hours=6), "DALLAS, TX", "Picked up", "Tendered at FedEx origin facility")
@@ -93,53 +93,58 @@ BASE_TEMPLATE = """
    <meta charset="UTF-8">
    <meta name="viewport" content="width=device-width, initial-scale=1.0">
    <title>{{ title }}</title>
-   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%234d148c' rx='4'/><text x='16' y='22' font-size='13' font-weight='700' font-style='italic' text-anchor='middle' fill='white' font-family='Arial'>Fx</text></svg>">
+   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%23ffffff'/><text x='16' y='23' font-size='14' font-weight='700' font-style='italic' text-anchor='middle' font-family='Arial'><tspan fill='%234d148c'>Fe</tspan><tspan fill='%23ff6600'>dx</tspan></text></svg>">
    <style>
         * { box-sizing: border-box; }
-        body { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; margin: 0; padding: 0; background: linear-gradient(#f8f8f8, #f2f2f2); color: #333; }
+        body { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; margin: 0; padding: 0; background: #ffffff; color: #333; }
         a { color: #4d148c; }
         header { background-color: #ffffff; border-bottom: 1px solid #e5e5e5; padding: 0; }
         .container { max-width: 1000px; margin: 0 auto; padding: 0 20px; }
-        .header-content { display: flex; justify-content: space-between; align-items: center; padding: 14px 0; }
-        .logo { font-size: 30px; font-weight: 800; letter-spacing: -2px; font-style: italic; }
-        .logo .fed { color: #4d148c; }
-        .logo .ex { color: #ff6600; }
-        .logo small { display: block; font-size: 9px; font-style: normal; letter-spacing: 2px; color: #666; text-transform: uppercase; margin-top: -2px; }
+        .header-content { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; }
+        .logo-wrap { display: flex; align-items: flex-end; gap: 18px; }
+        .logo-svg { height: 34px; display: block; }
+        .logo-sub { font-size: 15px; color: #6b6b6b; font-weight: 400; letter-spacing: .5px; padding-bottom: 3px; border-left: 1px solid #ddd; padding-left: 18px; height: 26px; display: flex; align-items: center; }
+        .top-links { font-size: 13px; }
+        .top-links a { color: #6b6b6b; text-decoration: none; margin-left: 22px; }
+        .top-links a:hover { color: #4d148c; }
         nav { background: #4d148c; }
         nav .container { display: flex; }
         nav a { color: white; text-decoration: none; padding: 12px 18px; font-size: 14px; font-weight: 600; display: block; }
         nav a:hover { background: #3a0f6b; }
-        nav a.active { background: #ff6600; }
-        .main-content { background: white; min-height: 400px; padding: 40px 20px; margin-top: 20px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); border-radius: 2px; }
+        nav a.active { background: transparent; box-shadow: inset 0 -4px 0 #ff6600; }
+        .main-content { background: white; min-height: 400px; padding: 40px 20px; }
         .search-box { text-align: center; margin-bottom: 30px; }
-        .search-box h1 { font-size: 26px; margin-bottom: 6px; color: #333; font-weight: 600; }
-        .search-box .sub { color: #777; font-size: 14px; margin-bottom: 24px; }
+        .search-box h1 { font-size: 26px; margin-bottom: 6px; font-weight: 500; }
+        .search-box h1 .fed { color: #4d148c; font-style: italic; font-weight: 800; letter-spacing: -1px; }
+        .search-box h1 .ex { color: #ff6600; font-style: italic; font-weight: 800; letter-spacing: -1px; }
+        .search-box .sub { color: #75757a; font-size: 15px; margin-bottom: 24px; }
         .input-group { display: inline-flex; gap: 10px; }
-        input[type="text"] { padding: 12px 15px; width: 320px; border: 1px solid #bbb; border-radius: 3px; font-size: 16px; }
+        input[type="text"] { padding: 12px 15px; width: 340px; border: 1px solid #bdbcbd; border-radius: 3px; font-size: 16px; }
         input[type="text"]:focus { outline: none; border-color: #4d148c; box-shadow: 0 0 0 2px rgba(77,20,140,0.15); }
-        button { background-color: #ff6600; color: white; border: none; padding: 12px 28px; font-size: 15px; font-weight: bold; border-radius: 3px; cursor: pointer; }
+        button { background-color: #ff6600; color: white; border: none; padding: 12px 30px; font-size: 15px; font-weight: bold; border-radius: 3px; cursor: pointer; }
         button:hover { background-color: #e55b00; }
         .error-msg { background-color: #fdf2f2; border-left: 4px solid #cc0000; color: #721c24; padding: 15px 18px; border-radius: 3px; margin-top: 20px; text-align: left; max-width: 600px; margin-left: auto; margin-right: auto; font-size: 14px; }
-        .result-card { max-width: 820px; margin: 0 auto; border: 1px solid #ddd; background: #fff; }
+        .result-card { max-width: 820px; margin: 0 auto; border: 1px solid #e0e0e0; background: #fff; }
         .result-header { padding: 22px; border-bottom: 1px solid #eee; background: #fafafa; }
-        .result-header h2 { margin: 0; font-size: 16px; color: #666; font-weight: 500; }
-        .result-header .status { font-size: 20px; font-weight: 700; color: #333; margin-top: 4px; }
-        .result-header .eta { font-size: 14px; color: #666; margin-top: 4px; }
-        .progress-bar { display: flex; gap: 4px; padding: 0 22px 16px; background: #fafafa; }
+        .result-header h2 { margin: 0; font-size: 14px; color: #75757a; font-weight: 500; text-transform: uppercase; letter-spacing: .5px; }
+        .result-header .status { font-size: 22px; font-weight: 700; color: #333; margin-top: 6px; }
+        .result-header .eta { font-size: 14px; color: #75757a; margin-top: 4px; }
+        .progress-bar { display: flex; gap: 4px; padding: 0 22px 0; background: #fafafa; }
         .progress-bar span { flex: 1; height: 5px; background: #ddd; border-radius: 3px; }
         .progress-bar span.on { background: #ff6600; }
-        .progress-labels { display: flex; justify-content: space-between; max-width: 820px; margin: 0 auto; padding: 6px 22px 0; font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: .5px; }
+        .progress-labels { display: flex; justify-content: space-between; max-width: 820px; margin: 0 auto; padding: 6px 22px 16px; background: #fafafa; font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: .5px; }
         .result-details { padding: 20px 22px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 20px; font-size: 14px; }
-        .detail-col strong { display: block; color: #999; font-size: 11px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .5px; }
+        .detail-col strong { display: block; color: #75757a; font-size: 11px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .5px; font-weight: 600; }
         .timeline { padding: 22px; }
-        .timeline h3 { font-size: 13px; text-transform: uppercase; color: #666; margin-bottom: 15px; letter-spacing: 1px; }
-        .event { display: flex; gap: 20px; padding-bottom: 15px; margin-bottom: 15px; border-bottom: 1px solid #f0f0f0; }
+        .timeline h3 { font-size: 13px; text-transform: uppercase; color: #75757a; margin-bottom: 18px; letter-spacing: 1px; font-weight: 600; }
+        .event { display: flex; gap: 0; padding-bottom: 16px; margin-bottom: 16px; border-bottom: 1px solid #f0f0f0; position: relative; }
         .event:last-child { border-bottom: none; }
-        .event-time { min-width: 150px; font-size: 13px; color: #666; }
+        .event-marker { min-width: 26px; padding-top: 4px; }
+        .event-marker .dot { width: 9px; height: 9px; border-radius: 50%; background: #ff6600; display: block; }
+        .event-time { min-width: 165px; font-size: 13px; color: #75757a; padding-top: 2px; }
         .event-info { flex: 1; }
         .event-desc { font-weight: bold; font-size: 14px; color: #333; }
-        .event-loc { font-size: 13px; color: #666; margin-top: 2px; }
-        .event-loc::before { content:"\\1F4CD "; margin-right: 2px; }
+        .event-loc { font-size: 13px; color: #75757a; margin-top: 2px; }
         .disclaimer { max-width: 820px; margin: 24px auto 0; font-size: 12px; color: #888; line-height: 1.5; }
         footer { background: #4d148c; color: #fff; margin-top: 40px; }
         footer .fcontainer { max-width: 1000px; margin: 0 auto; padding: 26px 20px; }
@@ -148,12 +153,27 @@ BASE_TEMPLATE = """
         footer .flinks a:hover { text-decoration: underline; }
         footer .tagline { font-size: 13px; opacity: .7; }
         footer .legal { font-size: 11px; opacity: .6; margin-top: 10px; line-height: 1.6; }
+        @media (max-width: 600px) {
+            .logo-sub { display: none; }
+            .input-group { flex-direction: column; }
+            input[type="text"] { width: 100%; }
+            .event-time { min-width: 110px; }
+        }
    </style>
 </head>
 <body>
    <header>
        <div class="container header-content">
-            <div class="logo"><span class="fed">Fed</span><span class="ex">Ex</span><small>Tracking</small></div>
+            <div class="logo-wrap">
+                <svg class="logo-svg" viewBox="0 0 600 120" xmlns="http://www.w3.org/2000/svg" aria-label="FedEx">
+                  <text x="0" y="88" font-family="Arial, Helvetica, sans-serif" font-size="100" font-weight="bold" font-style="italic" letter-spacing="-6"><tspan fill="#4d148c">Fed</tspan><tspan fill="#ff6600">Ex</tspan></text>
+                </svg>
+                <span class="logo-sub">Tracking</span>
+            </div>
+            <div class="top-links">
+                <a href="#">Log In</a>
+                <a href="#">Support</a>
+            </div>
        </div>
    </header>
     <nav>
@@ -189,7 +209,7 @@ BASE_TEMPLATE = """
 
 INDEX_TEMPLATE = """
 <div class="search-box">
-   <h1>Track Your Shipment</h1>
+   <h1><span class="fed">Fed</span><span class="ex">Ex</span> Tracking</h1>
    <div class="sub">Enter your tracking number to see the latest status of your shipment.</div>
    <form action="/" method="post" class="input-group">
         <input type="text" name="tracking_number" value="{{ tn }}" placeholder="Enter tracking number" required autofocus>
@@ -234,17 +254,18 @@ INDEX_TEMPLATE = """
        <h3>Travel History</h3>
        {% for e in events %}
        <div class="event">
+           <div class="event-marker"><span class="dot"></span></div>
            <div class="event-time">{{ e['timestamp'] }}</div>
            <div class="event-info">
                <div class="event-desc">{{ e['description'] }}</div>
-                <div class="event-loc">{{ e['location'] }}{% if e['details'] %} - {{ e['details'] }}{% endif %}</div>
+               <div class="event-loc">{{ e['location'] }}{% if e['details'] %} - {{ e['details'] }}{% endif %}</div>
            </div>
        </div>
        {% endfor %}
    </div>
 </div>
 <div class="disclaimer">
-    Shipment tracking information is provided as a convenience. Delivery times are estimates and not guaranteed. For assistance, contact FedEx Customer Service at 1-800-GoFedEx.
+    Shipment tracking information is provided as a convenience. Delivery times are estimates and not guaranteed. For assistance, contact FedEx Customer Service at 1-800-555-0187.
 </div>
 {% endif %}
 """
