@@ -3,10 +3,10 @@ import sqlite3, os, random, datetime, string
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-me-please")
-DB_PATH = "/tmp/fedex.db"
+DB_PATH = os.environ.get("DB_PATH", "/tmp/fedex.db")
 
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "fedex123")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "Deebaby25!")
 
 CITIES = [
     ("Memphis, TN", "FedEx Express World Hub"),
@@ -20,6 +20,9 @@ CITIES = [
 ]
 
 def init_db():
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS trackings (
@@ -44,6 +47,7 @@ def init_db():
         description TEXT,
         notes TEXT
     )""")
+    c.execute("CREATE INDEX IF NOT EXISTS events_tn ON events(tracking_number)")
     conn.commit()
     conn.close()
 
@@ -192,8 +196,12 @@ def track():
         return render_template_string(PAGE, content=render_template_string(HOME, error=True), year=datetime.datetime.now().year)
     return render_template_string(PAGE, content=render_template_string(RESULT, tracking=row, events=events), year=datetime.datetime.now().year)
 
-@app.route("/admin")
+@app.route("/admin", methods=["GET", "POST"])
 def admin():
+    if request.method == "POST":
+        if request.form.get("username") == ADMIN_USER and request.form.get("password") == ADMIN_PASS:
+            session["admin"] = True
+        return redirect("/admin")
     if not session.get("admin"):
         return render_template_string(PAGE, content="""
         <div class="page" style="max-width:480px;margin-top:60px;">
@@ -233,12 +241,6 @@ def admin():
     {items}</table></div>"""
     return render_template_string(PAGE, content=content, year=datetime.datetime.now().year)
 
-@app.route("/admin", methods=["POST"])
-def admin_login():
-    if request.form["username"] == ADMIN_USER and request.form["password"] == ADMIN_PASS:
-        session["admin"] = True
-    return redirect("/admin")
-
 @app.route("/admin/create", methods=["POST"])
 def admin_create():
     if not session.get("admin"):
@@ -256,7 +258,6 @@ def admin_create():
                fmt_ts(now), eta_str))
     conn.commit()
     conn.close()
-    # seed realistic initial scans
     city, fac = random.choice(CITIES[:4])
     add_event(tn, now - datetime.timedelta(hours=random.randint(20, 30)), f"{city}", "Shipment information sent to FedEx")
     add_event(tn, now - datetime.timedelta(hours=random.randint(8, 18)), f"{city} - {fac}", "Picked up", "Shipment picked up from shipper")
@@ -268,6 +269,9 @@ def advance(tracking_number):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
+    if not c.execute("SELECT 1 FROM trackings WHERE tracking_number=?", (tracking_number,)).fetchone():
+        conn.close()
+        return redirect("/admin")
     count = c.execute("SELECT COUNT(*) FROM events WHERE tracking_number=?", (tracking_number,)).fetchone()[0]
     if count < 7:
         stage = [
@@ -290,4 +294,5 @@ def advance(tracking_number):
 init_db()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
