@@ -1,9 +1,16 @@
 import os, re, random, string, sqlite3
+from datetime import datetime, timezone
 from flask import Flask, render_template_string, request, redirect, url_for, abort
+from markupsafe import escape
 
 app = Flask(__name__)
 DB = os.environ.get("DB_PATH", "track.db")
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "changeme")
+STATUSES = (
+    "Label created", "Picked up", "In transit", "At local facility",
+    "Out for delivery", "Delivered", "Exception",
+)
+TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M"
 
 def db():
     c = sqlite3.connect(DB)
@@ -12,12 +19,17 @@ def db():
 
 def init():
     with db() as c:
+        c.execute("BEGIN IMMEDIATE")
         c.execute("""CREATE TABLE IF NOT EXISTS pkgs(
             num TEXT PRIMARY KEY, status TEXT, origin TEXT, dest TEXT,
             created TEXT DEFAULT CURRENT_TIMESTAMP)""")
         c.execute("""CREATE TABLE IF NOT EXISTS events(
             id INTEGER PRIMARY KEY AUTOINCREMENT, num TEXT, [when] TEXT,
-            text TEXT, loc TEXT)""")
+            text TEXT, loc TEXT, out_of_order INTEGER NOT NULL DEFAULT 0)""")
+        columns = {column["name"] for column in c.execute("PRAGMA table_info(events)")}
+        if "out_of_order" not in columns:
+            c.execute("ALTER TABLE events ADD COLUMN out_of_order INTEGER NOT NULL DEFAULT 0")
+        c.execute("CREATE INDEX IF NOT EXISTS events_num_when ON events(num, [when])")
 init()
 
 CSS = """
@@ -71,27 +83,41 @@ RESULT = BASE % ("Tracking", CSS, """
 <div class="ev"><b>{{e['text']}}</b><span>{{e['when']}} · {{e['loc']}}</span></div>
 {% else %}<div class="ev">No activity yet.</div>{% endfor %}</div></section>""")
 
-ADMIN = BASE % ("Admin", CSS, """
-<section class="hero"><h1>Admin</h1>
-<p><a href="{{ url_for('home') }}">Back to tracking</a></p>{{ msg|safe }}
+ADMIN = BASE % ("Admin", CSS + """
+.panel .warning{color:#826031}
+.panel .box select{padding:13px 15px;border:1px solid #ccc;border-radius:4px;font-size:15px}
+""", """
+<section class="hero panel"><h1>Admin</h1>
+<p><a href="{{ url_for('home') }}">Back to tracking</a></p>
 <form method="post" action="{{ url_for('panel_add', k=k) }}" class="box">
 <input id="package-number" name="num" placeholder="Tracking number (blank = auto)">
 <button type="button" id="generate-number">Generate</button>
 <p id="generate-error" role="status"></p>
-<input name="status" placeholder="Status (e.g. In transit)">
+<select name="status" aria-label="Initial status">
+{% for status in statuses %}<option>{{ status }}</option>{% endfor %}</select>
 <input name="origin" placeholder="Origin city"><input name="dest" placeholder="Destination city">
 <button>Create package</button></form>
 {% if pkgs %}<h3 style="margin:24px 0 8px">Packages</h3>
-<table><tr><th>Number</th><th>Status</th><th>Route</th></tr>
-{% for p in pkgs %}<tr><td><a href="/result/{{p['num']}}">{{p['num']}}</a></td>
-<td>{{p['status']}}</td><td>{{p['origin']}}→{{p['dest']}}</td></tr>{% endfor %}</table>{% endif %}
+<table><tr><th>Number</th><th>Status</th><th>Route</th><th>Since newest event</th><th>Actions</th></tr>
+{% for p in pkgs %}<tr><td><a href="{{ url_for('result', num=p['num']) }}">{{p['num']}}</a>
+{% for event in warnings.get(p['num'], ()) %}
+<div class="warning">{{ event['when'] }} · {{ event['text'] }} · Saved out of order</div>
+{% endfor %}</td>
+<td>{{p['status']}}</td><td>{{p['origin']}}→{{p['dest']}}</td>
+<td{% if p['idle_hours'] is not none and p['idle_hours'] > 48 %} class="warning"{% endif %}>
+{% if p['idle_hours'] is none %}No dated events{% else %}{{ '%0.1f' | format(p['idle_hours']) }} h{% if p['idle_hours'] > 48 %} · Over 48 h{% endif %}{% endif %}</td>
+<td><form method="post" action="{{ url_for('panel_delete', k=k) }}"
+onsubmit="return confirm('Delete this package and all its events?')">
+<input type="hidden" name="num" value="{{ p['num'] }}"><button>Delete package</button>
+</form></td></tr>{% endfor %}</table>{% endif %}
 <h3 style="margin:28px 0 8px">Add event</h3>
 <form method="post" action="{{ url_for('panel_event', k=k) }}" class="box">
 <input name="num" placeholder="Tracking number" required>
 <input name="text" placeholder="Event text (e.g. Customs clearance)" required>
 <input name="loc" placeholder="Location" required>
-<input name="when" placeholder="2026-11-23 09:14" required>
-<input name="status" placeholder="Set new status (optional)">
+<input name="when" aria-label="Timestamp in UTC" placeholder="YYYY-MM-DD HH:MM (blank = now)">
+<select name="status" aria-label="New status"><option value="">Keep current status</option>
+{% for status in statuses %}<option>{{ status }}</option>{% endfor %}</select>
 <button>Add event</button></form></section>
 <script>
 document.getElementById('generate-number').addEventListener('click', async () => {
@@ -120,6 +146,17 @@ def guard():
     if request.args.get("k") != ADMIN_KEY:
         abort(403)
 
+def event_timestamp(value):
+    if not value:
+        return datetime.now(timezone.utc).strftime(TIMESTAMP_FORMAT)
+    try:
+        parsed = datetime.strptime(value, TIMESTAMP_FORMAT)
+    except ValueError:
+        abort(400, "Use YYYY-MM-DD HH:MM for the timestamp.")
+    if parsed.strftime(TIMESTAMP_FORMAT) != value:
+        abort(400, "Use YYYY-MM-DD HH:MM for the timestamp.")
+    return value
+
 @app.route("/")
 def home(): return render_template_string(HOME)
 
@@ -138,34 +175,75 @@ def generate(): return {"num": gen()}
 def result(num):
     c = db()
     p = c.execute("SELECT * FROM pkgs WHERE num=?", (num,)).fetchone()
-    if not p: return render_template_string(TRACKPAGE, msg=f'<p class="alert err">No package {num}</p>')
+    if not p: return render_template_string(TRACKPAGE, msg=f'<p class="alert err">No package {escape(num)}</p>')
     ev = c.execute("SELECT * FROM events WHERE num=? ORDER BY [when] DESC", (num,)).fetchall()
     return render_template_string(RESULT, p=p, ev=ev)
 
 @app.route("/panel")
 def panel():
     guard()
-    return render_template_string(ADMIN, k=ADMIN_KEY, msg="",
-        pkgs=db().execute("SELECT * FROM pkgs ORDER BY created DESC").fetchall())
+    with db() as c:
+        pkgs = c.execute("""
+            SELECT p.*, MAX(0, (julianday('now') - (
+                SELECT MAX(julianday(e.[when])) FROM events e WHERE e.num=p.num
+            )) * 24) AS idle_hours
+            FROM pkgs p ORDER BY p.created DESC
+        """).fetchall()
+        warnings = {}
+        for event in c.execute("SELECT * FROM events WHERE out_of_order=1 ORDER BY [when] DESC"):
+            warnings.setdefault(event["num"], []).append(event)
+    return render_template_string(ADMIN, k=ADMIN_KEY, pkgs=pkgs,
+                                  warnings=warnings, statuses=STATUSES)
 
 @app.route("/panel/add", methods=["POST"])
 def panel_add():
     guard()
-    num = (request.form.get("num") or gen()).strip()
+    num = request.form.get("num", "").strip() or gen()
+    if not re.fullmatch(r"\d{10,22}", num):
+        abort(400, "Use 10 to 22 digits for the tracking number.")
+    status = request.form.get("status") or STATUSES[0]
+    if status not in STATUSES:
+        abort(400, "Choose a status from the list.")
+    origin = request.form.get("origin") or "-"
+    dest = request.form.get("dest") or "-"
     with db() as c:
-        c.execute("INSERT OR REPLACE INTO pkgs(num,status,origin,dest) VALUES(?,?,?,?)",
-                  (num, request.form.get("status") or "Label created",
-                   request.form.get("origin") or "-", request.form.get("dest") or "-"))
+        inserted = c.execute("INSERT INTO pkgs(num,status,origin,dest) VALUES(?,?,?,?) ON CONFLICT(num) DO NOTHING",
+                             (num, status, origin, dest))
+        if not inserted.rowcount:
+            abort(409, "That tracking number already exists.")
+        c.execute("INSERT INTO events(num,text,loc,[when]) VALUES(?,?,?,?)",
+                  (num, "Label created", origin, event_timestamp("")))
     return redirect(url_for("panel", k=ADMIN_KEY))
 
 @app.route("/panel/event", methods=["POST"])
 def panel_event():
     guard()
+    num = request.form["num"].strip()
+    when = event_timestamp(request.form.get("when", "").strip())
+    status = request.form.get("status", "")
+    if status and status not in STATUSES:
+        abort(400, "Choose a status from the list.")
     with db() as c:
-        c.execute("INSERT INTO events(num,text,loc,[when]) VALUES(?,?,?,?)",
-                  (request.form["num"], request.form["text"], request.form["loc"], request.form["when"]))
-        if request.form.get("status"):
-            c.execute("UPDATE pkgs SET status=? WHERE num=?", (request.form["status"], request.form["num"]))
+        c.execute("BEGIN IMMEDIATE")
+        if not c.execute("SELECT 1 FROM pkgs WHERE num=?", (num,)).fetchone():
+            abort(404, "Package not found.")
+        out_of_order = c.execute(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE num=? AND julianday([when]) > julianday(?))",
+            (num, when),
+        ).fetchone()[0]
+        c.execute("INSERT INTO events(num,text,loc,[when],out_of_order) VALUES(?,?,?,?,?)",
+                  (num, request.form["text"], request.form["loc"], when, out_of_order))
+        if status:
+            c.execute("UPDATE pkgs SET status=? WHERE num=?", (status, num))
+    return redirect(url_for("panel", k=ADMIN_KEY))
+
+@app.route("/panel/delete", methods=["POST"])
+def panel_delete():
+    guard()
+    num = request.form["num"]
+    with db() as c:
+        c.execute("DELETE FROM events WHERE num=?", (num,))
+        c.execute("DELETE FROM pkgs WHERE num=?", (num,))
     return redirect(url_for("panel", k=ADMIN_KEY))
 
 if __name__ == "__main__": app.run(debug=True)
