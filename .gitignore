@@ -1,0 +1,4 @@
+track.db
+*.db
+__pycache__/
+.venv/
