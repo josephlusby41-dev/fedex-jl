@@ -1,5 +1,5 @@
 from flask import Flask, request, render_template_string, redirect, session
-import sqlite3, os, random, datetime
+import sqlite3, os, random, datetime, string
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-me-please")
@@ -51,7 +51,7 @@ def gen_tracking_number():
     return str(random.randint(700000000000, 799999999999))
 
 def rand_ref():
-    return "".join(random.choices(string.ascii_uppercase + string.digits, k=8)) if False else "".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+    return "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
 def fmt_ts(dt):
     return dt.strftime("%b %d, %Y %I:%M %p").replace("AM", "am").replace("PM", "pm")
@@ -287,7 +287,6 @@ def advance(tracking_number):
     conn.close()
     return redirect("/admin")
 
-import string
 init_db()
 
 if __name__ == "__main__":
