@@ -19,12 +19,28 @@ CITIES = [
     ("Oakland, CA", "FedEx Ground Facility"),
 ]
 
+SEEDED_EVENTS = 3
+
+STAGES = [
+    ("In transit", None, "Departed FedEx location", "In transit to destination"),
+    (None, None, "Arrived at FedEx hub", ""),
+    (None, None, "In transit", "On the way to destination city"),
+    (None, "Local destination city", "Arrived at local FedEx facility", ""),
+    (None, "Local destination city", "On FedEx vehicle for delivery", "Delivery scheduled today by end of day"),
+    ("Out for Delivery", "Local destination city", "Out for delivery", "On FedEx vehicle for delivery"),
+    ("Delivered", "Local destination city", "Delivered", "Left at front door - Signature not required"),
+]
+
+def db():
+    return sqlite3.connect(DB_PATH, timeout=15)
+
 def init_db():
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = db()
     c = conn.cursor()
+    c.execute("PRAGMA journal_mode=WAL")
     c.execute("""CREATE TABLE IF NOT EXISTS trackings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tracking_number TEXT UNIQUE,
@@ -37,7 +53,8 @@ def init_db():
         reference TEXT,
         status TEXT,
         created_at TEXT,
-        eta TEXT
+        eta TEXT,
+        stage INTEGER DEFAULT 0
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,8 +65,14 @@ def init_db():
         notes TEXT
     )""")
     c.execute("CREATE INDEX IF NOT EXISTS events_tn ON events(tracking_number)")
+    try:
+        c.execute("ALTER TABLE trackings ADD COLUMN stage INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
+
+init_db()
 
 def gen_tracking_number():
     return str(random.randint(700000000000, 799999999999))
@@ -61,7 +84,7 @@ def fmt_ts(dt):
     return dt.strftime("%b %d, %Y %I:%M %p").replace("AM", "am").replace("PM", "pm")
 
 def add_event(tracking_number, dt, location, description, notes=""):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db()
     c = conn.cursor()
     c.execute("INSERT INTO events (tracking_number, timestamp, location, description, notes) VALUES (?,?,?,?,?)",
               (tracking_number, fmt_ts(dt), location, description, notes))
@@ -146,6 +169,18 @@ HOME = """
 </div>
 """
 
+LOGIN = """
+<div class="page" style="max-width:480px;margin-top:60px;">
+<div class="summary" style="padding:26px;">
+<form method="POST" action="/admin">
+  <label>USERNAME</label><input name="username" required>
+  <label style="margin-top:14px;">PASSWORD</label><input type="password" name="password" required>
+  <button class="btn" type="submit">LOG IN</button>
+</form></div>
+{% if error %}<p class="err">Incorrect username or password.</p>{% endif %}
+</div>
+"""
+
 RESULT = """
 <div class="breadcrumb">Home &gt; Tracking &gt; Tracking Results</div>
 <div class="page">
@@ -178,45 +213,90 @@ RESULT = """
 </div>
 """
 
+def page(content, **ctx):
+    return render_template_string(PAGE, content=content, year=datetime.datetime.now().year, **ctx)
+
 @app.route("/", methods=["GET"])
 def home():
-    return render_template_string(PAGE, content=render_template_string(HOME, error=False), year=datetime.datetime.now().year)
+    return page(render_template_string(HOME, error=False))
+
+@app.route("/track", methods=["GET"])
+def track_page():
+    return page(render_template_string(HOME, error=False))
 
 @app.route("/track", methods=["POST"])
-def track():
+def track_submit():
     tn = request.form.get("tracking_number", "").strip()
-    conn = sqlite3.connect(DB_PATH)
+    if not tn:
+        return page(render_template_string(HOME, error=True)), 400
+    return redirect(f"/t/{tn}")
+
+@app.route("/t/<path:tracking_number>")
+def result(tracking_number):
+    conn = db()
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute("SELECT * FROM trackings WHERE tracking_number=?", (tn,))
-    row = c.fetchone()
-    events = c.execute("SELECT * FROM events WHERE tracking_number=? ORDER BY id DESC", (tn,)).fetchall()
-    conn.close()
+    row = c.execute("SELECT * FROM trackings WHERE tracking_number=?", (tracking_number,)).fetchone()
     if not row:
-        return render_template_string(PAGE, content=render_template_string(HOME, error=True), year=datetime.datetime.now().year)
-    return render_template_string(PAGE, content=render_template_string(RESULT, tracking=row, events=events), year=datetime.datetime.now().year)
+        conn.close()
+        return page(render_template_string(HOME, error=True)), 404
+    events = c.execute("SELECT * FROM events WHERE tracking_number=? ORDER BY id DESC", (tracking_number,)).fetchall()
+    conn.close()
+    return page(render_template_string(RESULT, tracking=row, events=events))
+
+@app.route("/advance/<path:tracking_number>")
+def advance(tracking_number):
+    if not session.get("admin"):
+        return redirect("/admin")
+    conn = db()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    row = c.execute("SELECT * FROM trackings WHERE tracking_number=?", (tracking_number,)).fetchone()
+    if not row:
+        conn.close()
+        return redirect("/admin")
+    stage = min((row["stage"] or 0) + 1, len(STAGES) - 1)
+    status, loc_city, desc, notes = STAGES[stage]
+    city, fac = random.choice(CITIES)
+    location = f"{fac}, {loc_city}" if loc_city else f"{fac}, {city}"
+    now = datetime.datetime.now()
+    c.execute("UPDATE trackings SET stage=?", (stage, tracking_number))
+    if status:
+        c.execute("UPDATE trackings SET status=? WHERE tracking_number=?", (status, tracking_number))
+    conn.commit()
+    conn.close()
+    add_event(tracking_number, now, location, desc, notes)
+    return redirect(f"/t/{tracking_number}")
+
+@app.route("/admin/delete/<path:tracking_number>")
+def admin_delete(tracking_number):
+    if not session.get("admin"):
+        return redirect("/admin")
+    conn = db()
+    conn.execute("DELETE FROM trackings WHERE tracking_number=?", (tracking_number,))
+    conn.execute("DELETE FROM events WHERE tracking_number=?", (tracking_number,))
+    conn.commit()
+    conn.close()
+    return redirect("/admin")
 
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
     if request.method == "POST":
         if request.form.get("username") == ADMIN_USER and request.form.get("password") == ADMIN_PASS:
             session["admin"] = True
-        return redirect("/admin")
+            return redirect("/admin")
+        return page(render_template_string(LOGIN, error=True)), 401
     if not session.get("admin"):
-        return render_template_string(PAGE, content="""
-        <div class="page" style="max-width:480px;margin-top:60px;">
-        <div class="summary" style="padding:26px;"><form method="POST" action="/admin">
-          <label>USERNAME</label><input name="username" required>
-          <label style="margin-top:14px;">PASSWORD</label><input type="password" name="password" required>
-          <button class="btn" type="submit">LOG IN</button>
-        </form></div></div>""", year=datetime.datetime.now().year)
-    conn = sqlite3.connect(DB_PATH)
+        return page(render_template_string(LOGIN, error=False))
+    conn = db()
     conn.row_factory = sqlite3.Row
     rows = conn.execute("SELECT * FROM trackings ORDER BY id DESC").fetchall()
     conn.close()
     items = "".join(
-        f"<tr><td>{r['tracking_number']}</td><td>{r['recipient_name']}</td><td>{r['status']}</td><td>{r['eta']}</td>"
-        f"<td><a href='/advance/{r['tracking_number']}'>Advance Scan</a></td></tr>" for r in rows)
+        f"<tr><td>{r['tracking_number']}</td><td>{r['recipient_name']}</td><td>{r['status']}</td>"
+        f"<td><a href='/t/{r['tracking_number']}'>View</a></td>"
+        f"<td><a href='/advance/{r['tracking_number']}'>Advance</a></td>"
+        f"<td><a href='/admin/delete/{r['tracking_number']}'>Delete</a></td></tr>" for r in rows)
     content = f"""<div class="page"><h1>Admin Panel</h1>
     <div class="summary" style="padding:20px;margin-bottom:24px;">
     <form method="POST" action="/admin/create" style="display:grid;gap:10px;grid-template-columns:1fr 1fr;">
@@ -237,9 +317,9 @@ def admin():
       <button class="btn" type="submit" style="grid-column:span 2;">CREATE TRACKING</button>
     </form></div>
     <table style="width:100%;border-collapse:collapse;">
-    <tr style="background:#4d148c;color:#fff;"><th style="padding:10px;text-align:left;">Tracking #</th><th style="padding:10px;text-align:left;">Recipient</th><th style="padding:10px;text-align:left;">Status</th><th style="padding:10px;text-align:left;">ETA</th><th></th></tr>
+    <tr style="background:#4d148c;color:#fff;"><th style="padding:10px;text-align:left;">Tracking #</th><th style="padding:10px;text-align:left;">Recipient</th><th style="padding:10px;text-align:left;">Status</th><th style="padding:10px;text-align:left;">View</th><th style="padding:10px;text-align:left;">Advance</th><th></th></tr>
     {items}</table></div>"""
-    return render_template_string(PAGE, content=content, year=datetime.datetime.now().year)
+    return page(content)
 
 @app.route("/admin/create", methods=["POST"])
 def admin_create():
@@ -250,49 +330,30 @@ def admin_create():
     days = random.choice([1, 2, 3])
     eta = now + datetime.timedelta(days=days)
     eta_str = eta.strftime("%b %d") + " by " + ("10:30 am" if days == 1 else ("4:30 pm" if days == 2 else "8:00 pm"))
-    conn = sqlite3.connect(DB_PATH)
+    conn = db()
     c = conn.cursor()
-    c.execute("INSERT INTO trackings (tracking_number, sender_name, recipient_name, recipient_address, service_type, weight, pieces, reference, status, created_at, eta) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+    c.execute("INSERT INTO trackings (tracking_number, sender_name, recipient_name, recipient_address, service_type, weight, pieces, reference, status, created_at, eta, stage) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
               (tn, request.form["sender_name"], request.form["recipient_name"], request.form["recipient_address"],
-               request.form["service_type"], request.form["weight"], "1", rand_ref(), "In Transit - On Time",
-               fmt_ts(now), eta_str))
+               request.form["service_type"], request.form["weight"], "1", rand_ref(),
+               "Shipment information sent to FedEx", fmt_ts(now), eta_str, 0))
     conn.commit()
     conn.close()
-    city, fac = random.choice(CITIES[:4])
-    add_event(tn, now - datetime.timedelta(hours=random.randint(20, 30)), f"{city}", "Shipment information sent to FedEx")
-    add_event(tn, now - datetime.timedelta(hours=random.randint(8, 18)), f"{city} - {fac}", "Picked up", "Shipment picked up from shipper")
-    add_event(tn, now - datetime.timedelta(hours=random.randint(2, 7)), f"{city} - {fac}", "Arrived at FedEx location")
-    return redirect("/admin")
 
-@app.route("/advance/<tracking_number>")
-def advance(tracking_number):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    if not c.execute("SELECT 1 FROM trackings WHERE tracking_number=?", (tracking_number,)).fetchone():
-        conn.close()
-        return redirect("/admin")
-    count = c.execute("SELECT COUNT(*) FROM events WHERE tracking_number=?", (tracking_number,)).fetchone()[0]
-    if count < 7:
-        stage = [
-            ("In transit", random.choice(CITIES[4:]), "Departed FedEx location", "In transit to destination"),
-            (None, random.choice(CITIES[4:]), "Arrived at FedEx hub", ""),
-            (None, random.choice(CITIES[4:]), "In transit", "On the way to destination city"),
-            (None, "Local destination city", "Arrived at local FedEx facility", ""),
-            (None, "Local destination city", "On FedEx vehicle for delivery", "Delivery scheduled today by end of day"),
-            ("Out for Delivery", "Local destination city", "Out for delivery", "On FedEx vehicle for delivery"),
-            ("Delivered", "Local destination city", "Delivered", "Left at front door - Signature not required"),
-        ][count]
-        now = datetime.datetime.now()
-        add_event(tracking_number, now, stage[1], stage[2], stage[3])
+    # backdated seed events so the timeline looks lived-in
+    seed_start = now - datetime.timedelta(hours=random.randint(8, 14))
+    for i in range(SEEDED_EVENTS):
+        city, fac = random.choice(CITIES)
+        stage = STAGES[i]
+        add_event(tn, seed_start + datetime.timedelta(hours=i * random.randint(2, 4)),
+                  f"{fac}, {city}", stage[2], stage[3])
+        # keep the viewable status consistent with the deepest seeded scan
         if stage[0]:
-            c.execute("UPDATE trackings SET status=? WHERE tracking_number=?", (stage[0], tracking_number))
+            conn = db()
+            conn.execute("UPDATE trackings SET status=?, stage=? WHERE tracking_number=?", (stage[0], i, tn))
             conn.commit()
-    conn.close()
-    return redirect("/admin")
+            conn.close()
 
-init_db()
+    return redirect(f"/t/{tn}")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
