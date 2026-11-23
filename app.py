@@ -3,6 +3,7 @@ import sqlite3
 import random
 import string
 import datetime
+from urllib.parse import quote
 from flask import Flask, request, render_template_string, redirect, session, url_for
 
 app = Flask(__name__)
@@ -33,12 +34,17 @@ STAGES = [
     ("Delivered", None),
 ]
 
+_db_initialized = False
+
 def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
+    global _db_initialized
+    if _db_initialized:
+        return
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
@@ -70,6 +76,7 @@ def init_db():
     conn.commit()
     conn.close()
     seed_demo_data()
+    _db_initialized = True
 
 def seed_demo_data():
     conn = get_db()
@@ -312,7 +319,7 @@ RESULT_TEMPLATE = """
     </div>
     <div class="progress-container">
         <div class="progress-bar">
-            {% for i in range(6) %}<span class="{{ 'on' if i <= progress_step else '' }}"></span>{% endfor %}
+            {% for i in range(5) %}<span class="{{ 'on' if i < progress_step else '' }}"></span>{% endfor %}
         </div>
         <div class="progress-labels">
             <span>Picked Up</span><span>In Transit</span><span>Out for Delivery</span><span>Delivered</span>
@@ -406,6 +413,10 @@ def page(content, title="FedEx | Tracking", **ctx):
 
 # --- ROUTES ---
 
+@app.before_request
+def ensure_db():
+    init_db()
+
 @app.route("/", methods=["GET"])
 def home():
     return page(render_template_string(HOME_TEMPLATE, error=False))
@@ -415,7 +426,7 @@ def track_submit():
     tn = request.form.get("tracking_number", "").strip()
     if not tn:
         return page(render_template_string(HOME_TEMPLATE, error=False))
-    return redirect(f"/t/{tn}")
+    return redirect(f"/t/{quote(tn)}")
 
 @app.route("/t/<path:tracking_number>")
 def result(tracking_number):
@@ -471,8 +482,9 @@ def admin_create():
     c = conn.cursor()
     c.execute("""INSERT INTO trackings (tracking_number, sender_name, recipient_name, recipient_address,
         service_type, weight, pieces, reference, status, created_at, eta) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-        (tn, request.form["sender_name"], request.form["recipient_name"], request.form["recipient_address"],
-         request.form["service_type"], request.form["weight"], "1", rand_ref(),
+        (tn, request.form.get("sender_name", ""), request.form.get("recipient_name", ""),
+         request.form.get("recipient_address", ""), request.form.get("service_type", "FedEx Ground"),
+         request.form.get("weight", "1 lb"), "1", rand_ref(),
          "Shipment information sent to FedEx", fmt_ts(now), eta_str))
     conn.commit()
     conn.close()
@@ -518,7 +530,6 @@ def admin_delete(tracking_number):
     conn.close()
     return redirect("/control-panel-8471")
 
-init_db()
-
 if __name__ == "__main__":
+    init_db()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
