@@ -3,14 +3,11 @@ import sqlite3
 import datetime
 import random
 import string
-from functools import wraps
-from flask import Flask, request, redirect, url_for, session, render_template_string, flash
+from flask import Flask, request, redirect, url_for, session, render_template_string
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key")
-
-# Database configuration
-DB_PATH = os.environ.get("DB_PATH", "/tmp/fedex.db")
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 # Admin credentials
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
@@ -33,40 +30,73 @@ SERVICES = [
     "FedEx Freight"
 ]
 
-def login_required(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if not session.get("admin"):
-            return redirect(url_for("admin_login"))
-        return f(*args, **kwargs)
-    return decorated_function
+# ---------------------------------------------------------------------------
+# Database path resolution
+# Order of preference:
+#   1. DB_PATH env var (explicit, always wins)
+#   2. A mounted persistent disk (DATA_DIR, defaults to /var/data)
+#   3. /tmp (ephemeral - wipes on every deploy)
+# ---------------------------------------------------------------------------
+def resolve_db_path():
+    explicit = os.environ.get("DB_PATH", "").strip()
+    if explicit:
+        parent = os.path.dirname(explicit)
+        if parent:
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except Exception:
+                pass
+        return explicit
+
+    data_dir = os.environ.get("DATA_DIR", "/var/data").strip()
+    if data_dir and os.path.isdir(data_dir) and os.access(data_dir, os.W_OK):
+        return os.path.join(data_dir, "fedex.db")
+
+    return "/tmp/fedex.db"
+
+
+DB_PATH = resolve_db_path()
+DB_IS_PERSISTENT = not DB_PATH.startswith("/tmp/")
+
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=20)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=20000")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
 
 def fmt_ts(dt):
     return dt.strftime("%b %d, %Y %I:%M %p").upper()
 
+
 def parse_dt(date_str, time_str):
-    """Parse date (YYYY-MM-DD) and time (HH:MM) strings into datetime. Falls back to now."""
     try:
         return datetime.datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
     except Exception:
         return datetime.datetime.now()
 
+
 def add_event_internal(c, tn, dt, location, description, details="", exception=0):
     c.execute("""INSERT INTO events (tracking_number, timestamp, location, description, details, exception)
                  VALUES (?, ?, ?, ?, ?, ?)""",
-              (tn, fmt_ts(dt), location, description, details, exception))
+              (tn, fmt_ts(dt), location, description, details, int(exception)))
+
 
 def init_db():
-    db_dir = os.path.dirname(DB_PATH)
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
+    parent = os.path.dirname(DB_PATH)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except Exception:
+            pass
+
     conn = get_db()
     c = conn.cursor()
+
     c.execute("""CREATE TABLE IF NOT EXISTS trackings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tracking_number TEXT UNIQUE,
@@ -81,6 +111,7 @@ def init_db():
         created_at TEXT,
         eta TEXT
     )""")
+
     c.execute("""CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tracking_number TEXT,
@@ -90,45 +121,50 @@ def init_db():
         details TEXT,
         exception INTEGER DEFAULT 0
     )""")
-    # Upgrade old databases that lack the exception column on events
-    cols = [r[1] for r in c.execute("PRAGMA table_info(events)").fetchall()]
+
+    # Patch databases created before the exception column existed
+    cols = [r["name"] for r in c.execute("PRAGMA table_info(events)").fetchall()]
     if "exception" not in cols:
-        c.execute("ALTER TABLE events ADD COLUMN exception INTEGER DEFAULT 0")
-    # Upgrade old databases that lack the exception columns on trackings
-    tcols = [r[1] for r in c.execute("PRAGMA table_info(trackings)").fetchall()]
-    if "exception" not in tcols:
-        c.execute("ALTER TABLE trackings ADD COLUMN exception TEXT")
-    if "exception_at" not in tcols:
-        c.execute("ALTER TABLE trackings ADD COLUMN exception_at TEXT")
-    if "prev_status" not in tcols:
-        c.execute("ALTER TABLE trackings ADD COLUMN prev_status TEXT")
+        try:
+            c.execute("ALTER TABLE events ADD COLUMN exception INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+
     c.execute("CREATE INDEX IF NOT EXISTS idx_events_tn ON events(tracking_number)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_trackings_tn ON trackings(tracking_number)")
     conn.commit()
     conn.close()
     seed_demo_data()
 
+
 def seed_demo_data():
     conn = get_db()
     c = conn.cursor()
-    count = c.execute("SELECT COUNT(*) FROM trackings").fetchone()[0]
+    try:
+        count = c.execute("SELECT COUNT(*) AS n FROM trackings").fetchone()["n"]
+    except sqlite3.OperationalError:
+        count = 0
     if count == 0:
         now = datetime.datetime.now()
         tn = "123456789012"
-        eta = now + datetime.timedelta(days=2)
-        eta_str = eta.strftime("%b %d") + " by 4:30 pm"
+        eta_str = (now + datetime.timedelta(days=2)).strftime("%b %d") + " by 4:30 pm"
         c.execute("""INSERT INTO trackings
             (tracking_number, sender_name, recipient_name, recipient_address, service_type, weight, pieces, reference, status, created_at, eta)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (tn, "ACME WIDGETS LLC", "MICHAEL HARRIS", "2814 OAK LN, AUSTIN TX 78704",
              "FedEx Ground", "4.2 lbs", "1", "PO-88213", "In transit - on time",
              fmt_ts(now), eta_str))
-        add_event_internal(c, tn, now - datetime.timedelta(hours=6), "DALLAS, TX", "Picked up", "Tendered at FedEx origin facility")
-        add_event_internal(c, tn, now - datetime.timedelta(hours=3), "DALLAS, TX", "In transit", "Departed FedEx location")
+        add_event_internal(c, tn, now - datetime.timedelta(hours=6), "DALLAS, TX",
+                           "Picked up", "Tendered at FedEx origin facility", 0)
+        add_event_internal(c, tn, now - datetime.timedelta(hours=3), "DALLAS, TX",
+                           "In transit", "Departed FedEx location", 0)
         conn.commit()
     conn.close()
 
+
 def rand_ref():
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+
 
 BASE_TEMPLATE = """
 <!DOCTYPE html>
@@ -168,14 +204,10 @@ BASE_TEMPLATE = """
         button { background-color: #ff6600; color: white; border: none; padding: 12px 30px; font-size: 15px; font-weight: bold; border-radius: 3px; cursor: pointer; }
         button:hover { background-color: #e55b00; }
         .error-msg { background-color: #fdf2f2; border-left: 4px solid #cc0000; color: #721c24; padding: 15px 18px; border-radius: 3px; margin-top: 20px; text-align: left; max-width: 600px; margin-left: auto; margin-right: auto; font-size: 14px; }
-        .flash-msg { max-width: 900px; margin: 0 auto 20px; padding: 12px 18px; border-radius: 3px; font-size: 14px; background: #f0fff4; border-left: 4px solid #2e7d32; color: #2e7d32; }
         .result-card { max-width: 820px; margin: 0 auto; border: 1px solid #e0e0e0; background: #fff; }
-        .result-card.has-exception { border-color: #e0b3b3; }
         .result-header { padding: 22px; border-bottom: 1px solid #eee; background: #fafafa; }
-        .result-header.exc { background: #fdf3f3; border-bottom: 1px solid #f0d0d0; }
         .result-header h2 { margin: 0; font-size: 14px; color: #75757a; font-weight: 500; text-transform: uppercase; letter-spacing: .5px; }
         .result-header .status { font-size: 22px; font-weight: 700; color: #333; margin-top: 6px; }
-        .result-header .status.exc { color: #cc0000; }
         .result-header .eta { font-size: 14px; color: #75757a; margin-top: 4px; }
         .progress-header { display: flex; align-items: center; justify-content: center; gap: 12px; background: #fafafa; padding: 18px 22px 8px; }
         .progress-header .mini-logo { height: 22px; display: block; }
@@ -185,10 +217,6 @@ BASE_TEMPLATE = """
         .progress-bar span.on { background: #ff6600; }
         .progress-bar span.exc { background: #cc0000; }
         .progress-labels { display: flex; justify-content: space-between; max-width: 820px; margin: 0 auto; padding: 6px 22px 16px; background: #fafafa; font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: .5px; }
-        .progress-labels span.exc { color: #cc0000; font-weight: 700; }
-        .exc-banner { background: #fdf2f2; border-left: 4px solid #cc0000; padding: 14px 18px; margin: 0 22px 20px; color: #721c24; font-size: 14px; border-radius: 3px; }
-        .exc-banner strong { display: block; margin-bottom: 4px; font-size: 12px; text-transform: uppercase; letter-spacing: .6px; }
-        .exc-time { font-size: 12px; color: #a15c5c; margin-top: 6px; }
         .result-details { padding: 20px 22px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 20px; font-size: 14px; }
         .detail-col strong { display: block; color: #75757a; font-size: 11px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .5px; font-weight: 600; }
         .timeline { padding: 22px; }
@@ -200,21 +228,12 @@ BASE_TEMPLATE = """
         .event.exception .event-marker .dot { background: #cc0000; }
         .event.exception .event-desc { color: #cc0000; }
         .event.exception .event-loc { color: #a33; }
+        .event.exception .event-time { color: #cc0000; }
         .event-time { min-width: 165px; font-size: 13px; color: #75757a; padding-top: 2px; }
         .event-info { flex: 1; }
         .event-desc { font-weight: bold; font-size: 14px; color: #333; }
         .event-loc { font-size: 13px; color: #75757a; margin-top: 2px; }
         .disclaimer { max-width: 820px; margin: 24px auto 0; font-size: 12px; color: #888; line-height: 1.5; }
-        .adm-exc { background: #fdf2f2; border: 1px solid #e0b3b3; padding: 16px; margin-bottom: 20px; }
-        .adm-exc h3 { margin-top: 0; color: #cc0000; font-size: 15px; text-transform: uppercase; letter-spacing: .5px; }
-        .exc-live { color: #cc0000; font-weight: 700; margin: 0 0 10px; font-size: 14px; }
-        .exc-live small { color: #a15c5c; font-weight: 400; }
-        .exc-form { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
-        .exc-form input[type="text"] { flex: 1; min-width: 180px; padding: 8px; width: auto; font-size: 14px; }
-        .btn-red { background: #cc0000; color: #fff; border: none; padding: 8px 14px; cursor: pointer; font-weight: 700; border-radius: 3px; font-size: 13px; }
-        .btn-red:hover { background: #a80000; }
-        .btn-clear { background: #fff; color: #cc0000; border: 1px solid #cc0000; padding: 8px 14px; cursor: pointer; font-weight: 700; border-radius: 3px; font-size: 13px; }
-        .btn-clear:hover { background: #fdf2f2; }
         footer { background: #4d148c; color: #fff; margin-top: 40px; }
         footer .fcontainer { max-width: 1000px; margin: 0 auto; padding: 26px 20px; }
         footer .flinks { display: flex; flex-wrap: wrap; gap: 8px 24px; font-size: 13px; margin-bottom: 18px; }
@@ -255,11 +274,6 @@ BASE_TEMPLATE = """
     </nav>
 
    <div class="container main-content">
-       {% with messages = get_flashed_messages(with_categories=true) %}
-           {% for category, message in messages %}
-               <div class="flash-msg">{{ message }}</div>
-           {% endfor %}
-       {% endwith %}
        {{ content | safe }}
    </div>
 
@@ -293,12 +307,13 @@ INDEX_TEMPLATE = """
 </div>
 
 {% if tracking %}
-{% set is_exc = tracking['exception'] %}
-<div class="result-card{% if is_exc %} has-exception{% endif %}">
-   <div class="result-header{% if is_exc %} exc{% endif %}">
+{% set st = tracking['status'] %}
+{% set has_exc = events | selectattr('exception') | list | length > 0 %}
+<div class="result-card">
+   <div class="result-header">
        <h2>Tracking Number: {{ tracking['tracking_number'] }}</h2>
-       <div class="status{% if is_exc %} exc{% endif %}">{{ tracking['status'] }}</div>
-       <div class="eta{% if is_exc %} exc{% endif %}">{% if is_exc %}Estimated Delivery: <strong>Delayed</strong>{% else %}Estimated Delivery: <strong>{{ tracking['eta'] }}</strong>{% endif %}</div>
+       <div class="status">{{ st }}</div>
+       <div class="eta">Estimated Delivery: <strong>{{ tracking['eta'] }}</strong></div>
    </div>
     <div class="progress-header">
         <svg class="mini-logo" viewBox="0 0 600 120" xmlns="http://www.w3.org/2000/svg" aria-label="FedEx">
@@ -307,22 +322,11 @@ INDEX_TEMPLATE = """
         <span class="ph">Shipment Progress</span>
     </div>
     <div class="progress-bar">
-        <span class="{% if is_exc %}exc{% elif 'Delivered' in tracking['status'] or 'Out for delivery' in tracking['status'] or 'In transit' in tracking['status'] %}on{% endif %}"></span>
-        <span class="{% if not is_exc and ('Out for delivery' in tracking['status'] or 'Delivered' in tracking['status']) %}on{% endif %}"></span>
-        <span class="{% if not is_exc and 'Delivered' in tracking['status'] %}on{% endif %}"></span>
+        <span class="{% if 'Delivered' in st or 'Out for delivery' in st or 'In transit' in st or has_exc %}on{% endif %}{% if has_exc %} exc{% endif %}"></span>
+        <span class="{% if 'Out for delivery' in st or 'Delivered' in st %}on{% endif %}"></span>
+        <span class="{% if 'Delivered' in st %}on{% endif %}"></span>
     </div>
-    <div class="progress-labels">
-        <span class="{% if is_exc %}exc{% endif %}">In Transit</span>
-        <span>Out for Delivery</span>
-        <span>Delivered</span>
-    </div>
-   {% if is_exc %}
-   <div class="exc-banner">
-       <strong>&#9888; Delivery Exception</strong>
-       {{ tracking['exception'] }}
-       {% if tracking['exception_at'] %}<div class="exc-time">Reported {{ tracking['exception_at'] }}</div>{% endif %}
-   </div>
-   {% endif %}
+    <div class="progress-labels"><span>In Transit</span><span>Out for Delivery</span><span>Delivered</span></div>
    <div class="result-details">
        <div class="detail-col">
            <strong>From</strong>
@@ -410,16 +414,19 @@ ADMIN_DASHBOARD_TEMPLATE = """
        </thead>
        <tbody>
            {% for t in trackings %}
-           <tr style="border-bottom: 1px solid #eee;{% if t['exception'] %} background: #fdf7f7;{% endif %}">
+           <tr style="border-bottom: 1px solid #eee;">
                <td style="padding: 10px;"><a href="/control-panel-8471/track/{{ t['tracking_number'] }}">{{ t['tracking_number'] }}</a></td>
                <td style="padding: 10px;">{{ t['recipient_name'] }}</td>
-               <td style="padding: 10px;{% if t['exception'] %} color: #cc0000; font-weight: bold;{% endif %}">{{ t['status'] }}</td>
+               <td style="padding: 10px;">{{ t['status'] }}</td>
                <td style="padding: 10px;">{{ t['eta'] }}</td>
                <td style="padding: 10px;"><a href="/control-panel-8471/track/{{ t['tracking_number'] }}">Manage</a></td>
            </tr>
            {% endfor %}
        </tbody>
    </table>
+   <p style="font-size: 12px; color: #888; margin-top: 18px;">
+       Database: {{ db_path }} ({{ "persistent" if db_persistent else "ephemeral - wipes on redeploy" }})
+   </p>
 </div>
 """
 
@@ -440,6 +447,9 @@ ADMIN_TRACK_TEMPLATE = """
            <input type="text" name="eta" value="{{ tracking['eta'] }}" placeholder="New ETA (e.g. Nov 25 by 4:30 pm)" style="flex: 1; padding: 8px;">
            <button type="submit" style="background: #4d148c; color: white; border: none; padding: 8px 15px; cursor: pointer;">Update ETA</button>
        </form>
+       <form action="/admin/advance/{{ tracking['tracking_number'] }}" method="post" style="margin-top: 10px;">
+           <button type="submit" style="background: #ff6600; color: white; border: none; padding: 8px 15px; cursor: pointer; font-weight: bold;">Advance Status &rarr;</button>
+       </form>
    </div>
 
    <h3 style="color: #4d148c;">Add Event</h3>
@@ -457,38 +467,39 @@ ADMIN_TRACK_TEMPLATE = """
        <input type="text" name="location" placeholder="Location (e.g. MEMPHIS, TN)" style="padding: 8px;" required>
        <input type="text" name="description" placeholder="Description (e.g. Arrived at FedEx location)" style="padding: 8px;" required>
        <input type="text" name="details" placeholder="Details (optional)" style="padding: 8px;">
-       <label style="font-size: 13px; color: #cc0000; font-weight: bold;">
-           <input type="checkbox" name="exception" value="1"> Mark as Exception (red event)
+       <label style="font-size: 13px; color: #555; display: flex; align-items: center; gap: 8px;">
+           <input type="checkbox" name="exception" value="1" style="width: auto;">
+           Mark as Exception (shows in red on tracking page)
        </label>
        <button type="submit" style="background: #ff6600; color: white; border: none; padding: 10px; cursor: pointer; font-weight: bold;">Add Event</button>
    </form>
 
-   <div class="adm-exc">
-       <h3>&#9888; Delivery Exception</h3>
-       {% if tracking['exception'] %}
-       <p class="exc-live">Active: {{ tracking['exception'] }}
-           {% if tracking['exception_at'] %}<br><small>Set {{ tracking['exception_at'] }}</small>{% endif %}
-       </p>
-       <form action="/admin/clear_exception/{{ tracking['tracking_number'] }}" method="post" class="exc-form">
-           <button type="submit" class="btn-clear">Clear Exception &amp; Restore Status</button>
-       </form>
-       {% else %}
-       <p style="font-size: 13px; color: #a15c5c; margin: 0 0 8px;">No exception active. Setting one turns the public page red and hides the ETA.</p>
-       {% endif %}
-       <form action="/admin/set_exception/{{ tracking['tracking_number'] }}" method="post" class="exc-form">
-           <input type="text" name="reason" placeholder="Exception reason (e.g. Delivery exception - address issue)" required>
-           <button type="submit" class="btn-red">Set Exception</button>
-       </form>
-   </div>
-
    <h3 style="color: #4d148c;">Shipment Events</h3>
    <div style="background: white; border: 1px solid #ddd; padding: 20px;">
        {% for e in events %}
-       <div style="padding: 10px 0; border-bottom: 1px solid #f0f0f0;{% if e['exception'] %} color: #cc0000;{% endif %}">
-            <strong>{{ e['timestamp'] }}</strong> - {{ e['description'] }} ({{ e['location'] }})
+       <div style="padding: 10px 0; border-bottom: 1px solid #f0f0f0; {% if e['exception'] %}border-left: 4px solid #cc0000; padding-left: 10px; background: #fff8f8;{% endif %}">
+            <strong {% if e['exception'] %}style="color: #cc0000;"{% endif %}>{{ e['timestamp'] }}</strong> - {{ e['description'] }} ({{ e['location'] }})
            {% if e['details'] %}<br><small style="color: #666;">{{ e['details'] }}</small>{% endif %}
+           <div style="margin-top: 6px; display: flex; gap: 8px;">
+               <form action="/admin/toggle_exception/{{ tracking['tracking_number'] }}/{{ e['id'] }}" method="post" style="display: inline;">
+                   <button type="submit" style="background: {% if e['exception'] %}#4d148c{% else %}#cc0000{% endif %}; color: white; border: none; padding: 3px 10px; cursor: pointer; font-size: 12px;">
+                       {% if e['exception'] %}Remove Exception{% else %}Toggle Exception{% endif %}
+                   </button>
+               </form>
+              <form action="/admin/delete_event/{{ tracking['tracking_number'] }}/{{ e['id'] }}" method="post" style="display: inline;">
+                   <button type="submit" style="background: #888; color: white; border: none; padding: 4px 10px; font-size: 12px; border-radius: 3px; cursor: pointer;">Delete</button>
+               </form>
+               <form action="/admin/toggle_exception/{{ tracking['tracking_number'] }}/{{ e['id'] }}" method="post" style="display: inline; margin-left: 6px;">
+                   <button type="submit" style="background: {% if e['is_exception'] %}#cc0000{% else %}#555{% endif %}; color: white; border: none; padding: 4px 10px; font-size: 12px; border-radius: 3px; cursor: pointer;">
+                       {% if e['is_exception'] %}Clear Exception{% else %}Flag Exception{% endif %}
+                   </button>
+               </form>
+           </div>
        </div>
        {% endfor %}
+       {% if not events %}
+       <p style="color: #888; font-size: 14px;">No events recorded for this shipment yet.</p>
+       {% endif %}
    </div>
 </div>
 """
@@ -504,6 +515,14 @@ ADMIN_LOGIN_TEMPLATE = """
     </form>
 </div>
 """
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not (session.get("admin") or session.get("logged_in")):
+            return redirect(url_for("admin_login"))
+        return f(*args, **kwargs)
+    return decorated
 
 @app.route("/", methods=["GET", "POST"])
 def index():
@@ -522,14 +541,13 @@ def index():
             error = "We could not find a shipment matching this tracking number. Please check the number and try again."
         conn.close()
 
-    title = "Tracking Results | FedEx" if tracking else "Tracking | FedEx"
+    title = "Tracking Results | ParcelTrack" if tracking else "Tracking | ParcelTrack"
     content = render_template_string(INDEX_TEMPLATE, tracking=tracking, events=events, error=error, tn=tn)
     return render_template_string(BASE_TEMPLATE, content=content, title=title)
 
 @app.route("/control-panel-8471")
+@login_required
 def admin():
-    if not session.get("admin"):
-        return redirect(url_for("admin_login"))
     conn = get_db()
     trackings = conn.execute("SELECT * FROM trackings ORDER BY id DESC").fetchall()
     conn.close()
@@ -546,6 +564,7 @@ def admin_login():
     if request.method == "POST":
         if request.form.get("username") == ADMIN_USER and request.form.get("password") == ADMIN_PASS:
             session["admin"] = True
+            session["logged_in"] = True
             return redirect(url_for("admin"))
         error = "Invalid credentials."
     content = render_template_string(ADMIN_LOGIN_TEMPLATE, error=error)
@@ -554,17 +573,17 @@ def admin_login():
 @app.route("/control-panel-8471/logout")
 def admin_logout():
     session.pop("admin", None)
+    session.pop("logged_in", None)
     return redirect(url_for("admin_login"))
 
 @app.route("/admin/create", methods=["POST"])
+@login_required
 def admin_create():
-    if not session.get("admin"):
-        return redirect(url_for("admin_login"))
     now = datetime.datetime.now()
     tn = request.form.get("tracking_number", "").strip() or "".join(random.choices(string.digits, k=12))
     reference = request.form.get("reference", "").strip() or rand_ref()
     city = request.form.get("origin_city", "").strip() or random.choice(CITIES)
-    facility = f"FedEx location in {city}"
+    facility = f"ParcelTrack location in {city}"
     ship_dt = parse_dt(request.form.get("ship_date", ""), request.form.get("ship_time", ""))
     eta_date = request.form.get("eta_date", "").strip()
     if eta_date:
@@ -585,8 +604,8 @@ def admin_create():
              request.form.get("recipient_address"), request.form.get("service_type"),
              request.form.get("weight"), request.form.get("pieces"), reference,
              request.form.get("status"), fmt_ts(ship_dt), eta_str))
-        add_event_internal(c, tn, ship_dt, city, "Shipment information sent to FedEx",
-                           facility + " - Reference: " + rand_ref())
+        add_event_internal(c, tn, ship_dt, city, "Shipment information sent to ParcelTrack",
+                           facility + " - Reference: " + rand_ref(), 0)
         conn.commit()
     except sqlite3.IntegrityError:
         pass
@@ -594,9 +613,8 @@ def admin_create():
     return redirect(url_for("admin"))
 
 @app.route("/control-panel-8471/track/<tn>")
+@login_required
 def admin_track(tn):
-    if not session.get("admin"):
-        return redirect(url_for("admin_login"))
     conn = get_db()
     tracking = conn.execute("SELECT * FROM trackings WHERE tracking_number = ?", (tn,)).fetchone()
     events = conn.execute("SELECT * FROM events WHERE tracking_number = ? ORDER BY id DESC", (tn,)).fetchall()
@@ -607,9 +625,8 @@ def admin_track(tn):
     return render_template_string(BASE_TEMPLATE, content=content, title="Manage Shipment")
 
 @app.route("/admin/update/<tn>", methods=["POST"])
+@login_required
 def admin_update(tn):
-    if not session.get("admin"):
-        return redirect(url_for("admin_login"))
     conn = get_db()
     conn.execute("UPDATE trackings SET status = ? WHERE tracking_number = ?", (request.form.get("status"), tn))
     conn.commit()
@@ -617,9 +634,8 @@ def admin_update(tn):
     return redirect(url_for("admin_track", tn=tn))
 
 @app.route("/admin/update_eta/<tn>", methods=["POST"])
+@login_required
 def admin_update_eta(tn):
-    if not session.get("admin"):
-        return redirect(url_for("admin_login"))
     conn = get_db()
     conn.execute("UPDATE trackings SET eta = ? WHERE tracking_number = ?", (request.form.get("eta"), tn))
     conn.commit()
@@ -627,49 +643,43 @@ def admin_update_eta(tn):
     return redirect(url_for("admin_track", tn=tn))
 
 @app.route("/admin/add_event/<tn>", methods=["POST"])
+@login_required
 def admin_add_event(tn):
-    if not session.get("admin"):
-        return redirect(url_for("admin_login"))
     event_dt = parse_dt(request.form.get("event_date", ""), request.form.get("event_time", ""))
+    is_exc = 1 if request.form.get("is_exception") else 0
     conn = get_db()
     add_event_internal(conn.cursor(), tn, event_dt,
                        request.form.get("location"), request.form.get("description"),
-                       request.form.get("details", ""))
+                       request.form.get("details", ""), is_exc)
     conn.commit()
     conn.close()
     return redirect(url_for("admin_track", tn=tn))
 
-@app.route("/admin/exception/<tn>", methods=["POST"])
-def admin_exception(tn):
-    if not session.get("admin"):
-        return redirect(url_for("admin_login"))
-    action = request.form.get("action", "set")
-    reason = request.form.get("reason", "").strip() or "Delivery exception - shipment delayed"
-    now = datetime.datetime.now()
+@app.route("/admin/toggle_exception/<tn>/<int:event_id>", methods=["POST"])
+@login_required
+def admin_toggle_exception(tn, event_id):
     conn = get_db()
     c = conn.cursor()
-    row = c.execute("SELECT status FROM trackings WHERE tracking_number = ?", (tn,)).fetchone()
+    row = c.execute("SELECT is_exception FROM events WHERE id = ?", (event_id,)).fetchone()
     if row:
-        if action == "set":
-            c.execute("""UPDATE trackings SET exception = ?, exception_at = ?, prev_status = ?
-                         WHERE tracking_number = ?""",
-                      (reason, fmt_ts(now), row["status"], tn))
-            add_event_internal(c, tn, now, random.choice(CITIES),
-                               "Delivery exception", reason)
-        else:
-            c.execute("""UPDATE trackings SET exception = NULL, exception_at = NULL,
-                         status = COALESCE(prev_status, status) WHERE tracking_number = ?""", (tn,))
-            add_event_internal(c, tn, now, random.choice(CITIES),
-                               "Exception resolved", "Shipment moving again - back on schedule")
+        c.execute("UPDATE events SET is_exception = ? WHERE id = ?", (0 if row["is_exception"] else 1, event_id))
+        conn.commit()
+    conn.close()
+    return redirect(url_for("admin_track", tn=tn))
+
+@app.route("/admin/delete_event/<tn>/<int:event_id>", methods=["POST"])
+@login_required
+def admin_delete_event(tn, event_id):
+    conn = get_db()
+    conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
     conn.commit()
     conn.close()
     return redirect(url_for("admin_track", tn=tn))
 
 @app.route("/admin/advance/<tn>", methods=["POST"])
+@login_required
 def admin_advance(tn):
-    if not session.get("admin"):
-        return redirect(url_for("admin_login"))
-    status_flow = ["Shipment information sent to FedEx", "Picked up", "In transit - on time",
+    status_flow = ["Shipment information sent to ParcelTrack", "Picked up", "In transit - on time",
                    "In transit - on time", "Out for delivery", "Delivered"]
     conn = get_db()
     c = conn.cursor()
@@ -681,18 +691,17 @@ def admin_advance(tn):
         except ValueError:
             new_status = "In transit - on time"
         now = datetime.datetime.now()
-        city, facility = random.choice(CITIES), "FedEx facility"
-        c.execute("UPDATE trackings SET status = ?, exception = NULL, exception_at = NULL WHERE tracking_number = ?",
-                  (new_status, tn))
+        city, facility = random.choice(CITIES), "ParcelTrack facility"
+        c.execute("UPDATE trackings SET status = ? WHERE tracking_number = ?", (new_status, tn))
         details = "Delivered - Signed for by: FRONT DESK" if new_status == "Delivered" else facility
-        add_event_internal(c, tn, now, city, new_status, details)
+        add_event_internal(c, tn, now, city, new_status, details, 0)
         if new_status == "Delivered":
             c.execute("UPDATE trackings SET eta = ? WHERE tracking_number = ?", ("Delivered " + fmt_ts(now), tn))
         conn.commit()
     conn.close()
     return redirect(url_for("admin"))
 
-# Initialize database on startup
+# initialize database on startup
 init_db()
 
 if __name__ == "__main__":
