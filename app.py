@@ -1,29 +1,16 @@
 import os
-import io
 import sqlite3
 import datetime
 import random
 import string
-import gzip
-import time
-import urllib.request
-import urllib.parse
-import json
-import threading
 from functools import wraps
-from flask import Flask, request, redirect, url_for, session, render_template_string
+from flask import Flask, request, redirect, url_for, session, render_template_string, flash
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key")
 
 # Database configuration
 DB_PATH = os.environ.get("DB_PATH", "/tmp/fedex.db")
-
-# Telegram vault for DB persistence across Render restarts
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "8877118461")
-VAULT_FILENAME = "fedex_db_backup.gz"
-BACKUP_DEBOUNCE = 30  # seconds; min time between Telegram uploads
 
 # Admin credentials
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
@@ -46,92 +33,6 @@ SERVICES = [
     "FedEx Freight"
 ]
 
-# ---------------- Telegram vault helpers ----------------
-
-def tg_api(method, params=None):
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/{method}"
-    data = urllib.parse.urlencode(params or {}).encode()
-    req = urllib.request.Request(url, data=data)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode())
-
-def upload_backup_to_telegram():
-    if not os.path.exists(DB_PATH):
-        return
-    buf = io.BytesIO()
-    with open(DB_PATH, "rb") as f:
-        buf.write(gzip.compress(f.read()))
-    buf.seek(0)
-    boundary = "----FedExBackupBoundary"
-    body = io.BytesIO()
-    body.write(f"--{boundary}\r\n".encode())
-    body.write(f'Content-Disposition: form-data; name="chat_id"\r\n\r\n{TG_CHAT_ID}\r\n'.encode())
-    body.write(f"--{boundary}\r\n".encode())
-    body.write(f'Content-Disposition: form-data; name="caption"\r\n\r\nFedEx DB backup {fmt_ts(datetime.datetime.now())}\r\n'.encode())
-    body.write(f"--{boundary}\r\n".encode())
-    body.write(f'Content-Disposition: form-data; name="document"; filename="{VAULT_FILENAME}"\r\n'.encode())
-    body.write(b"Content-Type: application/gzip\r\n\r\n")
-    body.write(buf.getvalue())
-    body.write(f"\r\n--{boundary}--\r\n".encode())
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendDocument",
-        data=body.getvalue(),
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        json.loads(resp.read().decode())
-
-def restore_db_from_telegram():
-    """Download the latest backup document from Telegram and restore DB if local DB is missing/empty."""
-    try:
-        updates = tg_api("getUpdates", {"offset": -100, "limit": 100}).get("result", [])
-    except Exception:
-        return
-    latest_file_id = None
-    for upd in reversed(updates):
-        msg = upd.get("message") or {}
-        doc = msg.get("document")
-        if doc and doc.get("file_name") == VAULT_FILENAME:
-            latest_file_id = doc["file_id"]
-            break
-    if not latest_file_id:
-        return
-    try:
-        link = tg_api("getFile", {"file_id": latest_file_id})["result"]["file_path"]
-        url = f"https://api.telegram.org/file/bot{TG_BOT_TOKEN}/{link}"
-        with urllib.request.urlopen(url, timeout=60) as resp:
-            raw = gzip.decompress(resp.read())
-        local_size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
-        # Only restore if local DB is missing or clearly empty/fresh
-        if local_size < len(raw) or local_size == 0:
-            with open(DB_PATH, "wb") as f:
-                f.write(raw)
-    except Exception:
-        pass
-
-_backup_lock = threading.Lock()
-_last_backup_time = 0.0
-
-def schedule_backup():
-    """Debounced backup: upload at most once every BACKUP_DEBOUNCE seconds."""
-    global _last_backup_time
-    if not _backup_lock.acquire(blocking=False):
-        return
-    def _do():
-        global _last_backup_time
-        try:
-            elapsed = time.time() - _last_backup_time
-            if elapsed < BACKUP_DEBOUNCE:
-                time.sleep(BACKUP_DEBOUNCE - elapsed)
-            upload_backup_to_telegram()
-            _last_backup_time = time.time()
-        except Exception:
-            pass
-        finally:
-            _backup_lock.release()
-    threading.Thread(target=_do, daemon=True).start()
-
-# ---------------- App helpers ----------------
-
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -143,14 +44,13 @@ def login_required(f):
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 def fmt_ts(dt):
     return dt.strftime("%b %d, %Y %I:%M %p").upper()
 
 def parse_dt(date_str, time_str):
+    """Parse date (YYYY-MM-DD) and time (HH:MM) strings into datetime. Falls back to now."""
     try:
         return datetime.datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
     except Exception:
@@ -165,7 +65,6 @@ def init_db():
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
-    restore_db_from_telegram()
     conn = get_db()
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS trackings (
@@ -191,9 +90,11 @@ def init_db():
         details TEXT,
         exception INTEGER DEFAULT 0
     )""")
+    # Upgrade old databases that lack the exception column on events
     cols = [r[1] for r in c.execute("PRAGMA table_info(events)").fetchall()]
     if "exception" not in cols:
         c.execute("ALTER TABLE events ADD COLUMN exception INTEGER DEFAULT 0")
+    # Upgrade old databases that lack the exception columns on trackings
     tcols = [r[1] for r in c.execute("PRAGMA table_info(trackings)").fetchall()]
     if "exception" not in tcols:
         c.execute("ALTER TABLE trackings ADD COLUMN exception TEXT")
@@ -533,201 +434,266 @@ ADMIN_TRACK_TEMPLATE = """
         <p><strong>Recipient:</strong> {{ tracking['recipient_name'] }} - {{ tracking['recipient_address'] }}</p>
        <form action="/admin/update/{{ tracking['tracking_number'] }}" method="post" style="display: flex; gap: 10px; margin-top: 15px;">
            <input type="text" name="status" value="{{ tracking['status'] }}" placeholder="New status" style="flex: 1; padding: 8px;">
-                      <button type="submit" style="padding: 8px 15px; background: #333; color: white; border: none; cursor: pointer;">Update</button>
+           <button type="submit" style="background: #4d148c; color: white; border: none; padding: 8px 15px; cursor: pointer;">Update Status</button>
        </form>
-       <form action="/admin/delete/{{ tracking['tracking_number'] }}" method="post" style="margin-top: 10px;">
-           <button type="submit" style="padding: 6px 12px; background: #a33; color: white; border: none; cursor: pointer;" onclick="return confirm('Delete this shipment?')">Delete</button>
+       <form action="/admin/update_eta/{{ tracking['tracking_number'] }}" method="post" style="display: flex; gap: 10px; margin-top: 10px;">
+           <input type="text" name="eta" value="{{ tracking['eta'] }}" placeholder="New ETA (e.g. Nov 25 by 4:30 pm)" style="flex: 1; padding: 8px;">
+           <button type="submit" style="background: #4d148c; color: white; border: none; padding: 8px 15px; cursor: pointer;">Update ETA</button>
        </form>
-       <p style="margin-top: 10px; font-size: 12px; color: #666;">Tracking #: {{ tracking['tracking_number'] }}</p>
    </div>
-   {% else %}
-   <p>No shipments yet. <a href="/admin/new">Create one</a>.</p>
-   {% endfor %}
-</body>
-</html>
+
+   <h3 style="color: #4d148c;">Add Event</h3>
+   <form action="/admin/add_event/{{ tracking['tracking_number'] }}" method="post" style="background: #f9f9f9; padding: 20px; border: 1px solid #ddd; margin-bottom: 30px; display: grid; gap: 10px;">
+       <div style="display: flex; gap: 10px;">
+           <div style="flex: 1;">
+               <label style="font-size: 13px; color: #555;">Event Date</label>
+               <input type="date" name="event_date" value="{{ today }}" style="padding: 8px; width: 100%;">
+           </div>
+           <div style="flex: 1;">
+               <label style="font-size: 13px; color: #555;">Event Time</label>
+               <input type="time" name="event_time" value="{{ now_time }}" style="padding: 8px; width: 100%;">
+           </div>
+       </div>
+       <input type="text" name="location" placeholder="Location (e.g. MEMPHIS, TN)" style="padding: 8px;" required>
+       <input type="text" name="description" placeholder="Description (e.g. Arrived at FedEx location)" style="padding: 8px;" required>
+       <input type="text" name="details" placeholder="Details (optional)" style="padding: 8px;">
+       <label style="font-size: 13px; color: #cc0000; font-weight: bold;">
+           <input type="checkbox" name="exception" value="1"> Mark as Exception (red event)
+       </label>
+       <button type="submit" style="background: #ff6600; color: white; border: none; padding: 10px; cursor: pointer; font-weight: bold;">Add Event</button>
+   </form>
+
+   <div class="adm-exc">
+       <h3>&#9888; Delivery Exception</h3>
+       {% if tracking['exception'] %}
+       <p class="exc-live">Active: {{ tracking['exception'] }}
+           {% if tracking['exception_at'] %}<br><small>Set {{ tracking['exception_at'] }}</small>{% endif %}
+       </p>
+       <form action="/admin/clear_exception/{{ tracking['tracking_number'] }}" method="post" class="exc-form">
+           <button type="submit" class="btn-clear">Clear Exception &amp; Restore Status</button>
+       </form>
+       {% else %}
+       <p style="font-size: 13px; color: #a15c5c; margin: 0 0 8px;">No exception active. Setting one turns the public page red and hides the ETA.</p>
+       {% endif %}
+       <form action="/admin/set_exception/{{ tracking['tracking_number'] }}" method="post" class="exc-form">
+           <input type="text" name="reason" placeholder="Exception reason (e.g. Delivery exception - address issue)" required>
+           <button type="submit" class="btn-red">Set Exception</button>
+       </form>
+   </div>
+
+   <h3 style="color: #4d148c;">Shipment Events</h3>
+   <div style="background: white; border: 1px solid #ddd; padding: 20px;">
+       {% for e in events %}
+       <div style="padding: 10px 0; border-bottom: 1px solid #f0f0f0;{% if e['exception'] %} color: #cc0000;{% endif %}">
+            <strong>{{ e['timestamp'] }}</strong> - {{ e['description'] }} ({{ e['location'] }})
+           {% if e['details'] %}<br><small style="color: #666;">{{ e['details'] }}</small>{% endif %}
+       </div>
+       {% endfor %}
+   </div>
+</div>
 """
 
+ADMIN_LOGIN_TEMPLATE = """
+<div style="max-width: 400px; margin: 60px auto; background: white; border: 1px solid #ddd; padding: 30px; box-shadow: 0 1px 4px rgba(0,0,0,0.08);">
+    <h2 style="color: #4d148c; margin-top: 0;">Admin Login</h2>
+    {% if error %}<div class="error-msg" style="margin-top: 0;">{{ error }}</div>{% endif %}
+    <form action="/control-panel-8471/login" method="post" style="display: grid; gap: 12px; margin-top: 15px;">
+        <input type="text" name="username" placeholder="Username" style="padding: 10px;" required>
+        <input type="password" name="password" placeholder="Password" style="padding: 10px;" required>
+        <button type="submit" style="width: 100%;">Login</button>
+    </form>
+</div>
+"""
 
-@app.route("/admin")
-def admin_index():
-    """Admin dashboard listing all tracked shipments."""
-    ensure_db()
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT * FROM shipments ORDER BY created_at DESC"
+@app.route("/", methods=["GET", "POST"])
+def index():
+    tracking = None
+    events = []
+    error = None
+    tn = request.form.get("tracking_number", "").strip() if request.method == "POST" else ""
+    if tn:
+        conn = get_db()
+        tracking = conn.execute("SELECT * FROM trackings WHERE tracking_number = ?", (tn,)).fetchone()
+        if tracking:
+            events = conn.execute(
+                "SELECT * FROM events WHERE tracking_number = ? ORDER BY id DESC", (tn,)
             ).fetchall()
-            shipments = [dict(r) for r in rows]
-    except sqlite3.Error as e:
-        return render_template_string(
-            ADMIN_PAGE.replace("<!--LOOP-->", "<!--LOOP-->"),
-            trackings=[],
-            error=str(e),
-        )
+        else:
+            error = "We could not find a shipment matching this tracking number. Please check the number and try again."
+        conn.close()
 
-    loop_html = ""
-    if not shipments:
-        loop_html = "<p>No shipments yet. <a href=\"/admin/new\">Create one</a>.</p>"
-    else:
-        for s in shipments:
-            loop_html += render_loop_item(s)
+    title = "Tracking Results | FedEx" if tracking else "Tracking | FedEx"
+    content = render_template_string(INDEX_TEMPLATE, tracking=tracking, events=events, error=error, tn=tn)
+    return render_template_string(BASE_TEMPLATE, content=content, title=title)
 
-    page = ADMIN_PAGE.replace("<!--LOOP-->", loop_html)
-    return render_template_string(page)
+@app.route("/control-panel-8471")
+def admin():
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+    conn = get_db()
+    trackings = conn.execute("SELECT * FROM trackings ORDER BY id DESC").fetchall()
+    conn.close()
+    now = datetime.datetime.now()
+    content = render_template_string(ADMIN_DASHBOARD_TEMPLATE, trackings=trackings,
+                                     services=SERVICES, today=now.strftime("%Y-%m-%d"),
+                                     now_time=now.strftime("%H:%M"),
+                                     eta_default=(now + datetime.timedelta(days=2)).strftime("%Y-%m-%d"))
+    return render_template_string(BASE_TEMPLATE, content=content, title="Admin Dashboard")
 
-
-def render_loop_item(s):
-    """Render one admin shipment card."""
-    return f"""
-   <div style="background: #f9f9f9; padding: 20px; border: 1px solid #ddd; margin-bottom: 20px;">
-       <p><strong>Status:</strong> {s.get('status', '')}</p>
-       <p><strong>ETA:</strong> {s.get('eta', '')}</p>
-       <p><strong>Recipient:</strong> {s.get('recipient_name', '')} - {s.get('recipient_address', '')}</p>
-       <form action="/admin/update/{s.get('tracking_number', '')}" method="post" style="display: flex; gap: 10px; margin-top: 15px;">
-           <input type="text" name="status" value="{s.get('status', '')}" placeholder="New status" style="flex: 1; padding: 8px;">
-           <button type="submit" style="padding: 8px 15px; background: #333; color: white; border: none; cursor: pointer;">Update</button>
-       </form>
-       <form action="/admin/delete/{s.get('tracking_number', '')}" method="post" style="margin-top: 10px;">
-           <button type="submit" style="padding: 6px 12px; background: #a33; color: white; border: none; cursor: pointer;" onclick="return confirm('Delete this shipment?')">Delete</button>
-       </form>
-       <p style="margin-top: 10px; font-size: 12px; color: #666;">Tracking #: {s.get('tracking_number', '')}</p>
-   </div>
-"""
-
-
-@app.route("/admin/new", methods=["GET", "POST"])
-def admin_new():
-    """Form to create a new shipment."""
-    ensure_db()
+@app.route("/control-panel-8471/login", methods=["GET", "POST"])
+def admin_login():
+    error = None
     if request.method == "POST":
-        tracking_number = (request.form.get("tracking_number") or "").strip().upper()
-        recipient_name = (request.form.get("recipient_name") or "").strip()
-        recipient_address = (request.form.get("recipient_address") or "").strip()
-        status = (request.form.get("status") or "Label created").strip()
-        eta = (request.form.get("eta") or "").strip()
+        if request.form.get("username") == ADMIN_USER and request.form.get("password") == ADMIN_PASS:
+            session["admin"] = True
+            return redirect(url_for("admin"))
+        error = "Invalid credentials."
+    content = render_template_string(ADMIN_LOGIN_TEMPLATE, error=error)
+    return render_template_string(BASE_TEMPLATE, content=content, title="Admin Login")
 
-        if not tracking_number:
-            tracking_number = generate_tracking_number()
+@app.route("/control-panel-8471/logout")
+def admin_logout():
+    session.pop("admin", None)
+    return redirect(url_for("admin_login"))
 
-        now = int(time.time())
+@app.route("/admin/create", methods=["POST"])
+def admin_create():
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+    now = datetime.datetime.now()
+    tn = request.form.get("tracking_number", "").strip() or "".join(random.choices(string.digits, k=12))
+    reference = request.form.get("reference", "").strip() or rand_ref()
+    city = request.form.get("origin_city", "").strip() or random.choice(CITIES)
+    facility = f"FedEx location in {city}"
+    ship_dt = parse_dt(request.form.get("ship_date", ""), request.form.get("ship_time", ""))
+    eta_date = request.form.get("eta_date", "").strip()
+    if eta_date:
         try:
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute(
-                    """INSERT OR REPLACE INTO shipments
-                       (tracking_number, recipient_name, recipient_address, status, eta, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (tracking_number, recipient_name, recipient_address, status, eta, now, now),
-                )
-                conn.commit()
-        except sqlite3.Error as e:
-            return render_template_string(NEW_PAGE, error=str(e), values=request.form)
-
-        notify_backup()
-        return redirect("/admin")
-
-    return render_template_string(NEW_PAGE, error=None, values={})
-
-
-@app.route("/admin/update/<tracking_number>", methods=["POST"])
-def admin_update(tracking_number):
-    """Update the status line of a shipment."""
-    ensure_db()
-    new_status = (request.form.get("status") or "").strip()
-    if not new_status:
-        return redirect("/admin")
-
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "UPDATE shipments SET status = ?, updated_at = ? WHERE tracking_number = ?",
-                (new_status, int(time.time()), tracking_number),
-            )
-            conn.commit()
-    except sqlite3.Error:
-        pass
-
-    notify_backup()
-    return redirect("/admin")
-
-
-@app.route("/admin/delete/<tracking_number>", methods=["POST"])
-def admin_delete(tracking_number):
-    """Delete a shipment record."""
-    ensure_db()
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "DELETE FROM shipments WHERE tracking_number = ?", (tracking_number,)
-            )
-            conn.commit()
-    except sqlite3.Error:
-        pass
-
-    notify_backup()
-    return redirect("/admin")
-
-
-@app.route("/admin/visits")
-def admin_visits():
-    """Show recent visit log entries."""
-    ensure_db()
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT * FROM visits ORDER BY created_at DESC LIMIT 200"
-            ).fetchall()
-            visits = [dict(r) for r in rows]
-    except sqlite3.Error as e:
-        return f"<pre>DB error: {e}</pre>"
-
-    out = ["<html><body style='font-family: monospace; padding: 20px;'>"]
-    out.append("<h2>Recent Visits</h2><a href='/admin'>&larr; Back</a><hr>")
-    if not visits:
-        out.append("<p>No visits logged yet.</p>")
+            eta_dt = datetime.datetime.strptime(eta_date, "%Y-%m-%d")
+            eta_str = eta_dt.strftime("%b %d") + " by 4:30 pm"
+        except Exception:
+            eta_str = (now + datetime.timedelta(days=2)).strftime("%b %d") + " by 4:30 pm"
     else:
-        for v in visits:
-            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(v.get("created_at", 0)))
-            out.append(
-                f"<p><b>{ts}</b> &mdash; {v.get('ip', '')} "
-                f"<br>UA: {v.get('user_agent', '')}"
-                f"<br>Path: {v.get('path', '')}</p><hr>"
-            )
-    out.append("</body></html>")
-    return "".join(out)
-
-
-@app.route("/admin/notify", methods=["POST"])
-def admin_notify():
-    """Trigger a manual Telegram backup."""
-    notify_backup()
-    return redirect("/admin")
-
-
-@app.before_request
-def log_visit():
-    """Log every non-static request into the visits table."""
-    if request.path.startswith("/static"):
-        return
+        eta_str = (now + datetime.timedelta(days=2)).strftime("%b %d") + " by 4:30 pm"
+    conn = get_db()
+    c = conn.cursor()
     try:
-        ensure_db()
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "INSERT INTO visits (ip, user_agent, path, created_at) VALUES (?, ?, ?, ?)",
-                (
-                    request.headers.get("X-Forwarded-For", request.remote_addr or ""),
-                    (request.headers.get("User-Agent") or "")[:400],
-                    request.path[:300],
-                    int(time.time()),
-                ),
-            )
-            conn.commit()
-    except sqlite3.Error:
+        c.execute("""INSERT INTO trackings
+            (tracking_number, sender_name, recipient_name, recipient_address, service_type, weight, pieces, reference, status, created_at, eta)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (tn, request.form.get("sender_name"), request.form.get("recipient_name"),
+             request.form.get("recipient_address"), request.form.get("service_type"),
+             request.form.get("weight"), request.form.get("pieces"), reference,
+             request.form.get("status"), fmt_ts(ship_dt), eta_str))
+        add_event_internal(c, tn, ship_dt, city, "Shipment information sent to FedEx",
+                           facility + " - Reference: " + rand_ref())
+        conn.commit()
+    except sqlite3.IntegrityError:
         pass
+    conn.close()
+    return redirect(url_for("admin"))
 
+@app.route("/control-panel-8471/track/<tn>")
+def admin_track(tn):
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+    conn = get_db()
+    tracking = conn.execute("SELECT * FROM trackings WHERE tracking_number = ?", (tn,)).fetchone()
+    events = conn.execute("SELECT * FROM events WHERE tracking_number = ? ORDER BY id DESC", (tn,)).fetchall()
+    conn.close()
+    now = datetime.datetime.now()
+    content = render_template_string(ADMIN_TRACK_TEMPLATE, tracking=tracking, events=events,
+                                     today=now.strftime("%Y-%m-%d"), now_time=now.strftime("%H:%M"))
+    return render_template_string(BASE_TEMPLATE, content=content, title="Manage Shipment")
+
+@app.route("/admin/update/<tn>", methods=["POST"])
+def admin_update(tn):
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+    conn = get_db()
+    conn.execute("UPDATE trackings SET status = ? WHERE tracking_number = ?", (request.form.get("status"), tn))
+    conn.commit()
+    conn.close()
+    return redirect(url_for("admin_track", tn=tn))
+
+@app.route("/admin/update_eta/<tn>", methods=["POST"])
+def admin_update_eta(tn):
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+    conn = get_db()
+    conn.execute("UPDATE trackings SET eta = ? WHERE tracking_number = ?", (request.form.get("eta"), tn))
+    conn.commit()
+    conn.close()
+    return redirect(url_for("admin_track", tn=tn))
+
+@app.route("/admin/add_event/<tn>", methods=["POST"])
+def admin_add_event(tn):
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+    event_dt = parse_dt(request.form.get("event_date", ""), request.form.get("event_time", ""))
+    conn = get_db()
+    add_event_internal(conn.cursor(), tn, event_dt,
+                       request.form.get("location"), request.form.get("description"),
+                       request.form.get("details", ""))
+    conn.commit()
+    conn.close()
+    return redirect(url_for("admin_track", tn=tn))
+
+@app.route("/admin/exception/<tn>", methods=["POST"])
+def admin_exception(tn):
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+    action = request.form.get("action", "set")
+    reason = request.form.get("reason", "").strip() or "Delivery exception - shipment delayed"
+    now = datetime.datetime.now()
+    conn = get_db()
+    c = conn.cursor()
+    row = c.execute("SELECT status FROM trackings WHERE tracking_number = ?", (tn,)).fetchone()
+    if row:
+        if action == "set":
+            c.execute("""UPDATE trackings SET exception = ?, exception_at = ?, prev_status = ?
+                         WHERE tracking_number = ?""",
+                      (reason, fmt_ts(now), row["status"], tn))
+            add_event_internal(c, tn, now, random.choice(CITIES),
+                               "Delivery exception", reason)
+        else:
+            c.execute("""UPDATE trackings SET exception = NULL, exception_at = NULL,
+                         status = COALESCE(prev_status, status) WHERE tracking_number = ?""", (tn,))
+            add_event_internal(c, tn, now, random.choice(CITIES),
+                               "Exception resolved", "Shipment moving again - back on schedule")
+    conn.commit()
+    conn.close()
+    return redirect(url_for("admin_track", tn=tn))
+
+@app.route("/admin/advance/<tn>", methods=["POST"])
+def admin_advance(tn):
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+    status_flow = ["Shipment information sent to FedEx", "Picked up", "In transit - on time",
+                   "In transit - on time", "Out for delivery", "Delivered"]
+    conn = get_db()
+    c = conn.cursor()
+    row = c.execute("SELECT status FROM trackings WHERE tracking_number = ?", (tn,)).fetchone()
+    if row:
+        try:
+            idx = status_flow.index(row["status"])
+            new_status = status_flow[min(idx + 1, len(status_flow) - 1)]
+        except ValueError:
+            new_status = "In transit - on time"
+        now = datetime.datetime.now()
+        city, facility = random.choice(CITIES), "FedEx facility"
+        c.execute("UPDATE trackings SET status = ?, exception = NULL, exception_at = NULL WHERE tracking_number = ?",
+                  (new_status, tn))
+        details = "Delivered - Signed for by: FRONT DESK" if new_status == "Delivered" else facility
+        add_event_internal(c, tn, now, city, new_status, details)
+        if new_status == "Delivered":
+            c.execute("UPDATE trackings SET eta = ? WHERE tracking_number = ?", ("Delivered " + fmt_ts(now), tn))
+        conn.commit()
+    conn.close()
+    return redirect(url_for("admin"))
+
+# Initialize database on startup
+init_db()
 
 if __name__ == "__main__":
-    init_db()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
