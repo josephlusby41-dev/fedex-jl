@@ -90,10 +90,18 @@ def init_db():
         details TEXT,
         exception INTEGER DEFAULT 0
     )""")
-    # Upgrade old databases that lack the exception column
+    # Upgrade old databases that lack the exception column on events
     cols = [r[1] for r in c.execute("PRAGMA table_info(events)").fetchall()]
     if "exception" not in cols:
         c.execute("ALTER TABLE events ADD COLUMN exception INTEGER DEFAULT 0")
+    # Upgrade old databases that lack the exception columns on trackings
+    tcols = [r[1] for r in c.execute("PRAGMA table_info(trackings)").fetchall()]
+    if "exception" not in tcols:
+        c.execute("ALTER TABLE trackings ADD COLUMN exception TEXT")
+    if "exception_at" not in tcols:
+        c.execute("ALTER TABLE trackings ADD COLUMN exception_at TEXT")
+    if "prev_status" not in tcols:
+        c.execute("ALTER TABLE trackings ADD COLUMN prev_status TEXT")
     c.execute("CREATE INDEX IF NOT EXISTS idx_events_tn ON events(tracking_number)")
     conn.commit()
     conn.close()
@@ -162,9 +170,12 @@ BASE_TEMPLATE = """
         .error-msg { background-color: #fdf2f2; border-left: 4px solid #cc0000; color: #721c24; padding: 15px 18px; border-radius: 3px; margin-top: 20px; text-align: left; max-width: 600px; margin-left: auto; margin-right: auto; font-size: 14px; }
         .flash-msg { max-width: 900px; margin: 0 auto 20px; padding: 12px 18px; border-radius: 3px; font-size: 14px; background: #f0fff4; border-left: 4px solid #2e7d32; color: #2e7d32; }
         .result-card { max-width: 820px; margin: 0 auto; border: 1px solid #e0e0e0; background: #fff; }
+        .result-card.has-exception { border-color: #e0b3b3; }
         .result-header { padding: 22px; border-bottom: 1px solid #eee; background: #fafafa; }
+        .result-header.exc { background: #fdf3f3; border-bottom: 1px solid #f0d0d0; }
         .result-header h2 { margin: 0; font-size: 14px; color: #75757a; font-weight: 500; text-transform: uppercase; letter-spacing: .5px; }
         .result-header .status { font-size: 22px; font-weight: 700; color: #333; margin-top: 6px; }
+        .result-header .status.exc { color: #cc0000; }
         .result-header .eta { font-size: 14px; color: #75757a; margin-top: 4px; }
         .progress-header { display: flex; align-items: center; justify-content: center; gap: 12px; background: #fafafa; padding: 18px 22px 8px; }
         .progress-header .mini-logo { height: 22px; display: block; }
@@ -174,6 +185,10 @@ BASE_TEMPLATE = """
         .progress-bar span.on { background: #ff6600; }
         .progress-bar span.exc { background: #cc0000; }
         .progress-labels { display: flex; justify-content: space-between; max-width: 820px; margin: 0 auto; padding: 6px 22px 16px; background: #fafafa; font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: .5px; }
+        .progress-labels span.exc { color: #cc0000; font-weight: 700; }
+        .exc-banner { background: #fdf2f2; border-left: 4px solid #cc0000; padding: 14px 18px; margin: 0 22px 20px; color: #721c24; font-size: 14px; border-radius: 3px; }
+        .exc-banner strong { display: block; margin-bottom: 4px; font-size: 12px; text-transform: uppercase; letter-spacing: .6px; }
+        .exc-time { font-size: 12px; color: #a15c5c; margin-top: 6px; }
         .result-details { padding: 20px 22px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 20px; font-size: 14px; }
         .detail-col strong { display: block; color: #75757a; font-size: 11px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .5px; font-weight: 600; }
         .timeline { padding: 22px; }
@@ -190,6 +205,16 @@ BASE_TEMPLATE = """
         .event-desc { font-weight: bold; font-size: 14px; color: #333; }
         .event-loc { font-size: 13px; color: #75757a; margin-top: 2px; }
         .disclaimer { max-width: 820px; margin: 24px auto 0; font-size: 12px; color: #888; line-height: 1.5; }
+        .adm-exc { background: #fdf2f2; border: 1px solid #e0b3b3; padding: 16px; margin-bottom: 20px; }
+        .adm-exc h3 { margin-top: 0; color: #cc0000; font-size: 15px; text-transform: uppercase; letter-spacing: .5px; }
+        .exc-live { color: #cc0000; font-weight: 700; margin: 0 0 10px; font-size: 14px; }
+        .exc-live small { color: #a15c5c; font-weight: 400; }
+        .exc-form { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+        .exc-form input[type="text"] { flex: 1; min-width: 180px; padding: 8px; width: auto; font-size: 14px; }
+        .btn-red { background: #cc0000; color: #fff; border: none; padding: 8px 14px; cursor: pointer; font-weight: 700; border-radius: 3px; font-size: 13px; }
+        .btn-red:hover { background: #a80000; }
+        .btn-clear { background: #fff; color: #cc0000; border: 1px solid #cc0000; padding: 8px 14px; cursor: pointer; font-weight: 700; border-radius: 3px; font-size: 13px; }
+        .btn-clear:hover { background: #fdf2f2; }
         footer { background: #4d148c; color: #fff; margin-top: 40px; }
         footer .fcontainer { max-width: 1000px; margin: 0 auto; padding: 26px 20px; }
         footer .flinks { display: flex; flex-wrap: wrap; gap: 8px 24px; font-size: 13px; margin-bottom: 18px; }
@@ -268,11 +293,12 @@ INDEX_TEMPLATE = """
 </div>
 
 {% if tracking %}
-<div class="result-card">
-   <div class="result-header">
+{% set is_exc = tracking['exception'] %}
+<div class="result-card{% if is_exc %} has-exception{% endif %}">
+   <div class="result-header{% if is_exc %} exc{% endif %}">
        <h2>Tracking Number: {{ tracking['tracking_number'] }}</h2>
-       <div class="status">{{ tracking['status'] }}</div>
-       <div class="eta">Estimated Delivery: <strong>{{ tracking['eta'] }}</strong></div>
+       <div class="status{% if is_exc %} exc{% endif %}">{{ tracking['status'] }}</div>
+       <div class="eta{% if is_exc %} exc{% endif %}">{% if is_exc %}Estimated Delivery: <strong>Delayed</strong>{% else %}Estimated Delivery: <strong>{{ tracking['eta'] }}</strong>{% endif %}</div>
    </div>
     <div class="progress-header">
         <svg class="mini-logo" viewBox="0 0 600 120" xmlns="http://www.w3.org/2000/svg" aria-label="FedEx">
@@ -281,11 +307,22 @@ INDEX_TEMPLATE = """
         <span class="ph">Shipment Progress</span>
     </div>
     <div class="progress-bar">
-        <span class="{% if 'Delivered' in tracking['status'] or 'Out for delivery' in tracking['status'] or 'In transit' in tracking['status'] %}on{% endif %}"></span>
-        <span class="{% if 'Out for delivery' in tracking['status'] or 'Delivered' in tracking['status'] %}on{% endif %}"></span>
-        <span class="{% if 'Delivered' in tracking['status'] %}on{% endif %}"></span>
+        <span class="{% if is_exc %}exc{% elif 'Delivered' in tracking['status'] or 'Out for delivery' in tracking['status'] or 'In transit' in tracking['status'] %}on{% endif %}"></span>
+        <span class="{% if not is_exc and ('Out for delivery' in tracking['status'] or 'Delivered' in tracking['status']) %}on{% endif %}"></span>
+        <span class="{% if not is_exc and 'Delivered' in tracking['status'] %}on{% endif %}"></span>
     </div>
-    <div class="progress-labels"><span>In Transit</span><span>Out for Delivery</span><span>Delivered</span></div>
+    <div class="progress-labels">
+        <span class="{% if is_exc %}exc{% endif %}">In Transit</span>
+        <span>Out for Delivery</span>
+        <span>Delivered</span>
+    </div>
+   {% if is_exc %}
+   <div class="exc-banner">
+       <strong>&#9888; Delivery Exception</strong>
+       {{ tracking['exception'] }}
+       {% if tracking['exception_at'] %}<div class="exc-time">Reported {{ tracking['exception_at'] }}</div>{% endif %}
+   </div>
+   {% endif %}
    <div class="result-details">
        <div class="detail-col">
            <strong>From</strong>
@@ -373,10 +410,10 @@ ADMIN_DASHBOARD_TEMPLATE = """
        </thead>
        <tbody>
            {% for t in trackings %}
-           <tr style="border-bottom: 1px solid #eee;">
+           <tr style="border-bottom: 1px solid #eee;{% if t['exception'] %} background: #fdf7f7;{% endif %}">
                <td style="padding: 10px;"><a href="/control-panel-8471/track/{{ t['tracking_number'] }}">{{ t['tracking_number'] }}</a></td>
                <td style="padding: 10px;">{{ t['recipient_name'] }}</td>
-               <td style="padding: 10px;">{{ t['status'] }}</td>
+               <td style="padding: 10px;{% if t['exception'] %} color: #cc0000; font-weight: bold;{% endif %}">{{ t['status'] }}</td>
                <td style="padding: 10px;">{{ t['eta'] }}</td>
                <td style="padding: 10px;"><a href="/control-panel-8471/track/{{ t['tracking_number'] }}">Manage</a></td>
            </tr>
@@ -413,13 +450,16 @@ ADMIN_TRACK_TEMPLATE = """
                <input type="date" name="event_date" value="{{ today }}" style="padding: 8px; width: 100%;">
            </div>
            <div style="flex: 1;">
-                         <label style="font-size: 13px; color: #555;">Event Time</label>
+               <label style="font-size: 13px; color: #555;">Event Time</label>
                <input type="time" name="event_time" value="{{ now_time }}" style="padding: 8px; width: 100%;">
            </div>
        </div>
        <input type="text" name="location" placeholder="Location (e.g. MEMPHIS, TN)" style="padding: 8px;" required>
        <input type="text" name="description" placeholder="Description (e.g. Arrived at FedEx location)" style="padding: 8px;" required>
        <input type="text" name="details" placeholder="Details (optional)" style="padding: 8px;">
+       <label style="font-size: 13px; color: #cc0000; font-weight: bold;">
+           <input type="checkbox" name="exception" value="1"> Mark as Exception (red event)
+       </label>
        <button type="submit" style="background: #ff6600; color: white; border: none; padding: 10px; cursor: pointer; font-weight: bold;">Add Event</button>
    </form>
 
@@ -444,7 +484,7 @@ ADMIN_TRACK_TEMPLATE = """
    <h3 style="color: #4d148c;">Shipment Events</h3>
    <div style="background: white; border: 1px solid #ddd; padding: 20px;">
        {% for e in events %}
-       <div style="padding: 10px 0; border-bottom: 1px solid #f0f0f0;">
+       <div style="padding: 10px 0; border-bottom: 1px solid #f0f0f0;{% if e['exception'] %} color: #cc0000;{% endif %}">
             <strong>{{ e['timestamp'] }}</strong> - {{ e['description'] }} ({{ e['location'] }})
            {% if e['details'] %}<br><small style="color: #666;">{{ e['details'] }}</small>{% endif %}
        </div>
@@ -559,9 +599,6 @@ def admin_track(tn):
         return redirect(url_for("admin_login"))
     conn = get_db()
     tracking = conn.execute("SELECT * FROM trackings WHERE tracking_number = ?", (tn,)).fetchone()
-    if not tracking:
-        conn.close()
-        return redirect(url_for("admin"))
     events = conn.execute("SELECT * FROM events WHERE tracking_number = ? ORDER BY id DESC", (tn,)).fetchall()
     conn.close()
     now = datetime.datetime.now()
@@ -602,39 +639,29 @@ def admin_add_event(tn):
     conn.close()
     return redirect(url_for("admin_track", tn=tn))
 
-@app.route("/admin/set_exception/<tn>", methods=["POST"])
-def admin_set_exception(tn):
+@app.route("/admin/exception/<tn>", methods=["POST"])
+def admin_exception(tn):
     if not session.get("admin"):
         return redirect(url_for("admin_login"))
+    action = request.form.get("action", "set")
     reason = request.form.get("reason", "").strip() or "Delivery exception - shipment delayed"
     now = datetime.datetime.now()
     conn = get_db()
     c = conn.cursor()
-    row = c.execute("SELECT status, exception FROM trackings WHERE tracking_number = ?", (tn,)).fetchone()
+    row = c.execute("SELECT status FROM trackings WHERE tracking_number = ?", (tn,)).fetchone()
     if row:
-        if not row["exception"]:
-            c.execute("UPDATE trackings SET prev_status = ? WHERE tracking_number = ?", (row["status"], tn))
-        c.execute("UPDATE trackings SET exception = ?, exception_at = ?, status = ? WHERE tracking_number = ?",
-                  (reason, fmt_ts(now), "Delivery exception", tn))
-        add_event_internal(c, tn, now, "FEDEX HUB", "Delivery exception", reason)
-        conn.commit()
-    conn.close()
-    return redirect(url_for("admin_track", tn=tn))
-
-@app.route("/admin/clear_exception/<tn>", methods=["POST"])
-def admin_clear_exception(tn):
-    if not session.get("admin"):
-        return redirect(url_for("admin_login"))
-    now = datetime.datetime.now()
-    conn = get_db()
-    c = conn.cursor()
-    row = c.execute("SELECT prev_status FROM trackings WHERE tracking_number = ?", (tn,)).fetchone()
-    if row:
-        restored = row["prev_status"] or "In transit - on time"
-        c.execute("UPDATE trackings SET exception = NULL, exception_at = NULL, prev_status = NULL, status = ? WHERE tracking_number = ?",
-                  (restored, tn))
-        add_event_internal(c, tn, now, "FEDEX HUB", "Exception cleared", "Shipment back in transit")
-        conn.commit()
+        if action == "set":
+            c.execute("""UPDATE trackings SET exception = ?, exception_at = ?, prev_status = ?
+                         WHERE tracking_number = ?""",
+                      (reason, fmt_ts(now), row["status"], tn))
+            add_event_internal(c, tn, now, random.choice(CITIES),
+                               "Delivery exception", reason)
+        else:
+            c.execute("""UPDATE trackings SET exception = NULL, exception_at = NULL,
+                         status = COALESCE(prev_status, status) WHERE tracking_number = ?""", (tn,))
+            add_event_internal(c, tn, now, random.choice(CITIES),
+                               "Exception resolved", "Shipment moving again - back on schedule")
+    conn.commit()
     conn.close()
     return redirect(url_for("admin_track", tn=tn))
 
@@ -655,7 +682,7 @@ def admin_advance(tn):
             new_status = "In transit - on time"
         now = datetime.datetime.now()
         city, facility = random.choice(CITIES), "FedEx facility"
-        c.execute("UPDATE trackings SET status = ?, exception = NULL, exception_at = NULL, prev_status = NULL WHERE tracking_number = ?",
+        c.execute("UPDATE trackings SET status = ?, exception = NULL, exception_at = NULL WHERE tracking_number = ?",
                   (new_status, tn))
         details = "Delivered - Signed for by: FRONT DESK" if new_status == "Delivered" else facility
         add_event_internal(c, tn, now, city, new_status, details)
