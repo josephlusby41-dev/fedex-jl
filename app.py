@@ -4,7 +4,7 @@ import datetime
 import random
 import string
 from functools import wraps
-from flask import Flask, request, redirect, url_for, session, render_template_string, flash
+from flask import Flask, request, redirect, url_for, session, render_template_string, flash, abort
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key")
@@ -169,6 +169,7 @@ BASE_TEMPLATE = """
         button:hover { background-color: #e55b00; }
         .error-msg { background-color: #fdf2f2; border-left: 4px solid #cc0000; color: #721c24; padding: 15px 18px; border-radius: 3px; margin-top: 20px; text-align: left; max-width: 600px; margin-left: auto; margin-right: auto; font-size: 14px; }
         .flash-msg { max-width: 900px; margin: 0 auto 20px; padding: 12px 18px; border-radius: 3px; font-size: 14px; background: #f0fff4; border-left: 4px solid #2e7d32; color: #2e7d32; }
+        .flash-msg.error { background: #fdf2f2; border-left-color: #cc0000; color: #721c24; }
         .result-card { max-width: 820px; margin: 0 auto; border: 1px solid #e0e0e0; background: #fff; }
         .result-card.has-exception { border-color: #e0b3b3; }
         .result-header { padding: 22px; border-bottom: 1px solid #eee; background: #fafafa; }
@@ -215,6 +216,11 @@ BASE_TEMPLATE = """
         .btn-red:hover { background: #a80000; }
         .btn-clear { background: #fff; color: #cc0000; border: 1px solid #cc0000; padding: 8px 14px; cursor: pointer; font-weight: 700; border-radius: 3px; font-size: 13px; }
         .btn-clear:hover { background: #fdf2f2; }
+        .btn-mini { background: #4d148c; color: #fff; border: none; padding: 5px 10px; cursor: pointer; font-weight: 700; border-radius: 3px; font-size: 12px; }
+        .btn-mini:hover { background: #3a0f6b; }
+        .btn-mini.danger { background: #cc0000; }
+        .btn-mini.danger:hover { background: #a80000; }
+        .actions { display: flex; gap: 6px; flex-wrap: wrap; }
         footer { background: #4d148c; color: #fff; margin-top: 40px; }
         footer .fcontainer { max-width: 1000px; margin: 0 auto; padding: 26px 20px; }
         footer .flinks { display: flex; flex-wrap: wrap; gap: 8px 24px; font-size: 13px; margin-bottom: 18px; }
@@ -257,7 +263,7 @@ BASE_TEMPLATE = """
    <div class="container main-content">
        {% with messages = get_flashed_messages(with_categories=true) %}
            {% for category, message in messages %}
-               <div class="flash-msg">{{ message }}</div>
+               <div class="flash-msg{% if category == 'error' %} error{% endif %}">{{ message }}</div>
            {% endfor %}
        {% endwith %}
        {{ content | safe }}
@@ -415,285 +421,239 @@ ADMIN_DASHBOARD_TEMPLATE = """
                <td style="padding: 10px;">{{ t['recipient_name'] }}</td>
                <td style="padding: 10px;{% if t['exception'] %} color: #cc0000; font-weight: bold;{% endif %}">{{ t['status'] }}</td>
                <td style="padding: 10px;">{{ t['eta'] }}</td>
-               <td style="padding: 10px;"><a href="/control-panel-8471/track/{{ t['tracking_number'] }}">Manage</a></td>
-           </tr>
-           {% endfor %}
-       </tbody>
-   </table>
-</div>
-"""
-
-ADMIN_TRACK_TEMPLATE = """
-<div style="max-width: 900px; margin: 0 auto;">
-    <a href="/control-panel-8471" style="color: #4d148c; text-decoration: none; font-size: 14px;">&larr; Back to Dashboard</a>
-   <h2 style="color: #4d148c;">Manage: {{ tracking['tracking_number'] }}</h2>
-
-   <div style="background: #f9f9f9; padding: 20px; border: 1px solid #ddd; margin-bottom: 20px;">
-       <p><strong>Status:</strong> {{ tracking['status'] }}</p>
-       <p><strong>ETA:</strong> {{ tracking['eta'] }}</p>
-        <p><strong>Recipient:</strong> {{ tracking['recipient_name'] }} - {{ tracking['recipient_address'] }}</p>
-       <form action="/admin/update/{{ tracking['tracking_number'] }}" method="post" style="display: flex; gap: 10px; margin-top: 15px;">
-           <input type="text" name="status" value="{{ tracking['status'] }}" placeholder="New status" style="flex: 1; padding: 8px;">
-           <button type="submit" style="background: #4d148c; color: white; border: none; padding: 8px 15px; cursor: pointer;">Update Status</button>
-       </form>
-       <form action="/admin/update_eta/{{ tracking['tracking_number'] }}" method="post" style="display: flex; gap: 10px; margin-top: 10px;">
-           <input type="text" name="eta" value="{{ tracking['eta'] }}" placeholder="New ETA (e.g. Nov 25 by 4:30 pm)" style="flex: 1; padding: 8px;">
-           <button type="submit" style="background: #4d148c; color: white; border: none; padding: 8px 15px; cursor: pointer;">Update ETA</button>
-       </form>
-   </div>
-
-   <h3 style="color: #4d148c;">Add Event</h3>
-   <form action="/admin/add_event/{{ tracking['tracking_number'] }}" method="post" style="background: #f9f9f9; padding: 20px; border: 1px solid #ddd; margin-bottom: 30px; display: grid; gap: 10px;">
-       <div style="display: flex; gap: 10px;">
-           <div style="flex: 1;">
-               <label style="font-size: 13px; color: #555;">Event Date</label>
-               <input type="date" name="event_date" value="{{ today }}" style="padding: 8px; width: 100%;">
-           </div>
-           <div style="flex: 1;">
-               <label style="font-size: 13px; color: #555;">Event Time</label>
-               <input type="time" name="event_time" value="{{ now_time }}" style="padding: 8px; width: 100%;">
-           </div>
-       </div>
-       <input type="text" name="location" placeholder="Location (e.g. MEMPHIS, TN)" style="padding: 8px;" required>
-       <input type="text" name="description" placeholder="Description (e.g. Arrived at FedEx location)" style="padding: 8px;" required>
-       <input type="text" name="details" placeholder="Details (optional)" style="padding: 8px;">
-       <label style="font-size: 13px; color: #cc0000; font-weight: bold;">
-           <input type="checkbox" name="exception" value="1"> Mark as Exception (red event)
-       </label>
-       <button type="submit" style="background: #ff6600; color: white; border: none; padding: 10px; cursor: pointer; font-weight: bold;">Add Event</button>
-   </form>
-
-   <div class="adm-exc">
-       <h3>&#9888; Delivery Exception</h3>
-       {% if tracking['exception'] %}
-       <p class="exc-live">Active: {{ tracking['exception'] }}
-           {% if tracking['exception_at'] %}<br><small>Set {{ tracking['exception_at'] }}</small>{% endif %}
-       </p>
-       <form action="/admin/clear_exception/{{ tracking['tracking_number'] }}" method="post" class="exc-form">
-           <button type="submit" class="btn-clear">Clear Exception &amp; Restore Status</button>
-       </form>
-       {% else %}
-       <p style="font-size: 13px; color: #a15c5c; margin: 0 0 8px;">No exception active. Setting one turns the public page red and hides the ETA.</p>
-       {% endif %}
-       <form action="/admin/set_exception/{{ tracking['tracking_number'] }}" method="post" class="exc-form">
-           <input type="text" name="reason" placeholder="Exception reason (e.g. Delivery exception - address issue)" required>
-           <button type="submit" class="btn-red">Set Exception</button>
-       </form>
-   </div>
-
-   <h3 style="color: #4d148c;">Shipment Events</h3>
-   <div style="background: white; border: 1px solid #ddd; padding: 20px;">
-       {% for e in events %}
-       <div style="padding: 10px 0; border-bottom: 1px solid #f0f0f0;{% if e['exception'] %} color: #cc0000;{% endif %}">
-            <strong>{{ e['timestamp'] }}</strong> - {{ e['description'] }} ({{ e['location'] }})
-           {% if e['details'] %}<br><small style="color: #666;">{{ e['details'] }}</small>{% endif %}
-       </div>
-       {% endfor %}
-   </div>
-</div>
-"""
-
-ADMIN_LOGIN_TEMPLATE = """
-<div style="max-width: 400px; margin: 60px auto; background: white; border: 1px solid #ddd; padding: 30px; box-shadow: 0 1px 4px rgba(0,0,0,0.08);">
-    <h2 style="color: #4d148c; margin-top: 0;">Admin Login</h2>
-    {% if error %}<div class="error-msg" style="margin-top: 0;">{{ error }}</div>{% endif %}
-    <form action="/control-panel-8471/login" method="post" style="display: grid; gap: 12px; margin-top: 15px;">
-        <input type="text" name="username" placeholder="Username" style="padding: 10px;" required>
-        <input type="password" name="password" placeholder="Password" style="padding: 10px;" required>
-        <button type="submit" style="width: 100%;">Login</button>
+               <td style="padding: 10px;">
+                   <div class="actions">
+                       <a href="/control-panel-8471/track/{{ t['tracking_number'] }}">Manage</a>
+                           <form action="/admin/advance/{{ t['tracking_number'] }}" method="post" style="display:inline;">
+        <button type="submit" class="btn btn-small">Advance Status ▶</button>
     </form>
+    <form action="/admin/delete/{{ t['tracking_number'] }}" method="post" style="display:inline;" onsubmit="return confirm('Delete this shipment?');">
+        <button type="submit" class="btn btn-small btn-danger">Delete ✕</button>
+    </form>
+</td>
+        </tr>
+        {% endfor %}
+    </table>
+
+    <h2>All Shipments</h2>
+    <table>
+        <tr>
+            <th>Tracking #</th>
+            <th>Recipient</th>
+            <th>Origin → Destination</th>
+            <th>Status</th>
+            <th>ETA</th>
+            <th>Exception</th>
+            <th>Actions</th>
+        </tr>
+        {% for s in shipments %}
+        <tr>
+            <td><a href="/admin/track/{{ s['tracking_number'] }}">{{ s['tracking_number'] }}</a></td>
+            <td>{{ s['recipient_name'] }}</td>
+            <td>{{ s['origin_city'] }}, {{ s['origin_state'] }} → {{ s['dest_city'] }}, {{ s['dest_state'] }}</td>
+            <td>{{ s['status'] }}</td>
+            <td>{{ s['eta_date'] }}</td>
+            <td>{{ s['exception_reason'] or '—' }}</td>
+            <td>
+                <form action="/admin/update/{{ s['tracking_number'] }}" method="post" class="inline-form">
+                    <select name="status">
+                        {% for st in ['Label Created', 'Picked Up', 'In Transit', 'Out for Delivery', 'Delivered', 'Exception'] %}
+                        <option value="{{ st }}" {% if s['status'] == st %}selected{% endif %}>{{ st }}</option>
+                        {% endfor %}
+                    </select>
+                    <input type="date" name="eta_date" value="{{ s['eta_date'] }}">
+                    <input type="text" name="location" placeholder="Current location" value="{{ s['current_location'] or '' }}">
+                    <button type="submit" class="btn btn-small">Update</button>
+                </form>
+                <form action="/admin/delete/{{ s['tracking_number'] }}" method="post" style="display:inline;" onsubmit="return confirm('Delete this shipment?');">
+                    <button type="submit" class="btn btn-small btn-danger">Delete</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+    </table>
 </div>
+</body>
+</html>
 """
 
-@app.route("/", methods=["GET", "POST"])
-def index():
-    tracking = None
-    events = []
-    error = None
-    tn = request.form.get("tracking_number", "").strip() if request.method == "POST" else ""
-    if tn:
-        conn = get_db()
-        tracking = conn.execute("SELECT * FROM trackings WHERE tracking_number = ?", (tn,)).fetchone()
-        if tracking:
-            events = conn.execute(
-                "SELECT * FROM events WHERE tracking_number = ? ORDER BY id DESC", (tn,)
-            ).fetchall()
-        else:
-            error = "We could not find a shipment matching this tracking number. Please check the number and try again."
-        conn.close()
 
-    title = "Tracking Results | FedEx" if tracking else "Tracking | FedEx"
-    content = render_template_string(INDEX_TEMPLATE, tracking=tracking, events=events, error=error, tn=tn)
-    return render_template_string(BASE_TEMPLATE, content=content, title=title)
+# ---------------- ADMIN ROUTES ----------------
 
-@app.route("/control-panel-8471")
-def admin():
+@app.route("/admin", methods=["GET"])
+def admin_dashboard():
     if not session.get("admin"):
         return redirect(url_for("admin_login"))
-    conn = get_db()
-    trackings = conn.execute("SELECT * FROM trackings ORDER BY id DESC").fetchall()
-    conn.close()
-    now = datetime.datetime.now()
-    content = render_template_string(ADMIN_DASHBOARD_TEMPLATE, trackings=trackings,
-                                     services=SERVICES, today=now.strftime("%Y-%m-%d"),
-                                     now_time=now.strftime("%H:%M"),
-                                     eta_default=(now + datetime.timedelta(days=2)).strftime("%Y-%m-%d"))
-    return render_template_string(BASE_TEMPLATE, content=content, title="Admin Dashboard")
+    db = get_db()
+    active = db.execute("SELECT * FROM shipments WHERE status != 'Delivered' ORDER BY eta_date").fetchall()
+    all_shipments = db.execute("SELECT * FROM shipments ORDER BY created_at DESC").fetchall()
+    return render_template_string(ADMIN_DASHBOARD_TEMPLATE, shipments=all_shipments, active=active)
 
-@app.route("/control-panel-8471/login", methods=["GET", "POST"])
+
+@app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     error = None
     if request.method == "POST":
-        if request.form.get("username") == ADMIN_USER and request.form.get("password") == ADMIN_PASS:
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
             session["admin"] = True
-            return redirect(url_for("admin"))
-        error = "Invalid credentials."
-    content = render_template_string(ADMIN_LOGIN_TEMPLATE, error=error)
-    return render_template_string(BASE_TEMPLATE, content=content, title="Admin Login")
+            return redirect(url_for("admin_dashboard"))
+        error = "Invalid credentials. Try again."
+    return render_template_string(ADMIN_LOGIN_TEMPLATE, error=error)
 
-@app.route("/control-panel-8471/logout")
+
+@app.route("/admin/logout")
 def admin_logout():
     session.pop("admin", None)
     return redirect(url_for("admin_login"))
 
-@app.route("/admin/create", methods=["POST"])
-def admin_create():
+
+@app.route("/admin/new", methods=["POST"])
+def admin_new_shipment():
     if not session.get("admin"):
         return redirect(url_for("admin_login"))
-    now = datetime.datetime.now()
-    tn = request.form.get("tracking_number", "").strip() or "".join(random.choices(string.digits, k=12))
-    reference = request.form.get("reference", "").strip() or rand_ref()
-    city = request.form.get("origin_city", "").strip() or random.choice(CITIES)
-    facility = f"FedEx location in {city}"
-    ship_dt = parse_dt(request.form.get("ship_date", ""), request.form.get("ship_time", ""))
-    eta_date = request.form.get("eta_date", "").strip()
-    if eta_date:
-        try:
-            eta_dt = datetime.datetime.strptime(eta_date, "%Y-%m-%d")
-            eta_str = eta_dt.strftime("%b %d") + " by 4:30 pm"
-        except Exception:
-            eta_str = (now + datetime.timedelta(days=2)).strftime("%b %d") + " by 4:30 pm"
+    tracking_number = request.form.get("tracking_number", "").strip()
+    if not tracking_number:
+        tracking_number = "FX" + "".join(random.choices(string.digits, k=10))
+    db = get_db()
+    existing = db.execute("SELECT 1 FROM shipments WHERE tracking_number = ?", (tracking_number,)).fetchone()
+    if existing:
+        flash_dup = True
     else:
-        eta_str = (now + datetime.timedelta(days=2)).strftime("%b %d") + " by 4:30 pm"
-    conn = get_db()
-    c = conn.cursor()
-    try:
-        c.execute("""INSERT INTO trackings
-            (tracking_number, sender_name, recipient_name, recipient_address, service_type, weight, pieces, reference, status, created_at, eta)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (tn, request.form.get("sender_name"), request.form.get("recipient_name"),
-             request.form.get("recipient_address"), request.form.get("service_type"),
-             request.form.get("weight"), request.form.get("pieces"), reference,
-             request.form.get("status"), fmt_ts(ship_dt), eta_str))
-        add_event_internal(c, tn, ship_dt, city, "Shipment information sent to FedEx",
-                           facility + " - Reference: " + rand_ref())
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass
-    conn.close()
-    return redirect(url_for("admin"))
+        db.execute(
+            """INSERT INTO shipments
+            (tracking_number, recipient_name, recipient_email, recipient_phone,
+             origin_city, origin_state, dest_city, dest_state, status, eta_date,
+             current_location, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                tracking_number,
+                request.form.get("recipient_name", ""),
+                request.form.get("recipient_email", ""),
+                request.form.get("recipient_phone", ""),
+                request.form.get("origin_city", ""),
+                request.form.get("origin_state", ""),
+                request.form.get("dest_city", ""),
+                request.form.get("dest_state", ""),
+                request.form.get("status", "Label Created"),
+                request.form.get("eta_date", ""),
+                request.form.get("current_location", ""),
+                request.form.get("notes", ""),
+            ),
+        )
+        db.commit()
+        flash_dup = False
+    db.close()
+    return redirect(url_for("admin_dashboard"))
 
-@app.route("/control-panel-8471/track/<tn>")
+
+@app.route("/admin/update/<tn>", methods=["POST"])
+def admin_update_shipment(tn):
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+    db = get_db()
+    db.execute(
+        """UPDATE shipments SET status = ?, eta_date = ?, current_location = ? WHERE tracking_number = ?""",
+        (
+            request.form.get("status", "In Transit"),
+            request.form.get("eta_date", ""),
+            request.form.get("location", ""),
+            tn,
+        ),
+    )
+    db.commit()
+    db.close()
+    return redirect(url_for("admin_dashboard"))
+
+
+@app.route("/admin/advance/<tn>", methods=["POST"])
+def admin_advance_shipment(tn):
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+    flow = ["Label Created", "Picked Up", "In Transit", "Out for Delivery", "Delivered"]
+    db = get_db()
+    row = db.execute("SELECT status FROM shipments WHERE tracking_number = ?", (tn,)).fetchone()
+    if row and row["status"] in flow:
+        idx = flow.index(row["status"])
+        if idx < len(flow) - 1:
+            db.execute("UPDATE shipments SET status = ? WHERE tracking_number = ?", (flow[idx + 1], tn))
+            db.commit()
+    db.close()
+    return redirect(url_for("admin_dashboard"))
+
+
+@app.route("/admin/delete/<tn>", methods=["POST"])
+def admin_delete_shipment(tn):
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+    db = get_db()
+    db.execute("DELETE FROM shipments WHERE tracking_number = ?", (tn,))
+    db.execute("DELETE FROM tracking_events WHERE tracking_number = ?", (tn,))
+    db.commit()
+    db.close()
+    return redirect(url_for("admin_dashboard"))
+
+
+@app.route("/admin/track/<tn>", methods=["GET", "POST"])
 def admin_track(tn):
     if not session.get("admin"):
         return redirect(url_for("admin_login"))
-    conn = get_db()
-    tracking = conn.execute("SELECT * FROM trackings WHERE tracking_number = ?", (tn,)).fetchone()
-    events = conn.execute("SELECT * FROM events WHERE tracking_number = ? ORDER BY id DESC", (tn,)).fetchall()
-    conn.close()
-    now = datetime.datetime.now()
-    content = render_template_string(ADMIN_TRACK_TEMPLATE, tracking=tracking, events=events,
-                                     today=now.strftime("%Y-%m-%d"), now_time=now.strftime("%H:%M"))
-    return render_template_string(BASE_TEMPLATE, content=content, title="Manage Shipment")
+    db = get_db()
+    shipment = db.execute("SELECT * FROM shipments WHERE tracking_number = ?", (tn,)).fetchone()
+    if not shipment:
+        db.close()
+        return redirect(url_for("admin_dashboard"))
 
-@app.route("/admin/update/<tn>", methods=["POST"])
-def admin_update(tn):
+    if request.method == "POST":
+        status = request.form.get("status", "In Transit")
+        location = request.form.get("location", "")
+        details = request.form.get("details", "")
+        exception = "exception" in request.form
+        db.execute(
+            "INSERT INTO tracking_events (tracking_number, status, location, details, is_exception) VALUES (?, ?, ?, ?, ?)",
+            (tn, status, location, details, 1 if exception else 0),
+        )
+        db.execute("UPDATE shipments SET status = ?, current_location = ? WHERE tracking_number = ?", (status, location, tn))
+        db.commit()
+
+    events = db.execute(
+        "SELECT * FROM tracking_events WHERE tracking_number = ? ORDER BY event_time DESC",
+        (tn,),
+    ).fetchall()
+    db.close()
+    return render_template_string(ADMIN_TRACK_TEMPLATE, s=shipment, events=events)
+
+
+@app.route("/admin/set_exception/<tn>", methods=["POST"])
+def admin_set_exception(tn):
     if not session.get("admin"):
         return redirect(url_for("admin_login"))
-    conn = get_db()
-    conn.execute("UPDATE trackings SET status = ? WHERE tracking_number = ?", (request.form.get("status"), tn))
-    conn.commit()
-    conn.close()
+    reason = request.form.get("exception_reason", "Delivery exception")
+    db = get_db()
+    db.execute("UPDATE shipments SET status = 'Exception', exception_reason = ? WHERE tracking_number = ?", (reason, tn))
+    db.execute(
+        "INSERT INTO tracking_events (tracking_number, status, location, details, is_exception) VALUES (?, ?, ?, ?, 1)",
+        (tn, "Exception", request.form.get("location", ""), reason),
+    )
+    db.commit()
+    db.close()
     return redirect(url_for("admin_track", tn=tn))
 
-@app.route("/admin/update_eta/<tn>", methods=["POST"])
-def admin_update_eta(tn):
+
+@app.route("/admin/clear_exception/<tn>", methods=["POST"])
+def admin_clear_exception(tn):
     if not session.get("admin"):
         return redirect(url_for("admin_login"))
-    conn = get_db()
-    conn.execute("UPDATE trackings SET eta = ? WHERE tracking_number = ?", (request.form.get("eta"), tn))
-    conn.commit()
-    conn.close()
+    db = get_db()
+    db.execute("UPDATE shipments SET status = 'In Transit', exception_reason = NULL WHERE tracking_number = ?", (tn,))
+    db.commit()
+    db.close()
     return redirect(url_for("admin_track", tn=tn))
 
-@app.route("/admin/add_event/<tn>", methods=["POST"])
-def admin_add_event(tn):
-    if not session.get("admin"):
-        return redirect(url_for("admin_login"))
-    event_dt = parse_dt(request.form.get("event_date", ""), request.form.get("event_time", ""))
-    conn = get_db()
-    add_event_internal(conn.cursor(), tn, event_dt,
-                       request.form.get("location"), request.form.get("description"),
-                       request.form.get("details", ""))
-    conn.commit()
-    conn.close()
-    return redirect(url_for("admin_track", tn=tn))
 
-@app.route("/admin/exception/<tn>", methods=["POST"])
-def admin_exception(tn):
-    if not session.get("admin"):
-        return redirect(url_for("admin_login"))
-    action = request.form.get("action", "set")
-    reason = request.form.get("reason", "").strip() or "Delivery exception - shipment delayed"
-    now = datetime.datetime.now()
-    conn = get_db()
-    c = conn.cursor()
-    row = c.execute("SELECT status FROM trackings WHERE tracking_number = ?", (tn,)).fetchone()
-    if row:
-        if action == "set":
-            c.execute("""UPDATE trackings SET exception = ?, exception_at = ?, prev_status = ?
-                         WHERE tracking_number = ?""",
-                      (reason, fmt_ts(now), row["status"], tn))
-            add_event_internal(c, tn, now, random.choice(CITIES),
-                               "Delivery exception", reason)
-        else:
-            c.execute("""UPDATE trackings SET exception = NULL, exception_at = NULL,
-                         status = COALESCE(prev_status, status) WHERE tracking_number = ?""", (tn,))
-            add_event_internal(c, tn, now, random.choice(CITIES),
-                               "Exception resolved", "Shipment moving again - back on schedule")
-    conn.commit()
-    conn.close()
-    return redirect(url_for("admin_track", tn=tn))
-
-@app.route("/admin/advance/<tn>", methods=["POST"])
-def admin_advance(tn):
-    if not session.get("admin"):
-        return redirect(url_for("admin_login"))
-    status_flow = ["Shipment information sent to FedEx", "Picked up", "In transit - on time",
-                   "In transit - on time", "Out for delivery", "Delivered"]
-    conn = get_db()
-    c = conn.cursor()
-    row = c.execute("SELECT status FROM trackings WHERE tracking_number = ?", (tn,)).fetchone()
-    if row:
-        try:
-            idx = status_flow.index(row["status"])
-            new_status = status_flow[min(idx + 1, len(status_flow) - 1)]
-        except ValueError:
-            new_status = "In transit - on time"
-        now = datetime.datetime.now()
-        city, facility = random.choice(CITIES), "FedEx facility"
-        c.execute("UPDATE trackings SET status = ?, exception = NULL, exception_at = NULL WHERE tracking_number = ?",
-                  (new_status, tn))
-        details = "Delivered - Signed for by: FRONT DESK" if new_status == "Delivered" else facility
-        add_event_internal(c, tn, now, city, new_status, details)
-        if new_status == "Delivered":
-            c.execute("UPDATE trackings SET eta = ? WHERE tracking_number = ?", ("Delivered " + fmt_ts(now), tn))
-        conn.commit()
-    conn.close()
-    return redirect(url_for("admin"))
-
-# Initialize database on startup
-init_db()
+# ---------------- MAIN ----------------
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    init_db()
+    app.run(host="0.0.0.0", port=5000, debug=True)
